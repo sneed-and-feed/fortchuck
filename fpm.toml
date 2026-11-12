@@ -1,0 +1,26 @@
+name = "fortchuck"
+version = "0.1.0"
+license = "CC0-1.0"
+author = "Noah Cohen"
+maintainer = "Noah Cohen"
+copyright = "CC0-1.0 Universal Public Domain Dedication"
+description = "Zero-allocation, thread-safe Modern Fortran Coupled Box x Stiefel Quasi-Newton Optimizer"
+
+[library]
+source-dir = "src"
+
+[build]
+auto-executables = false
+auto-tests = true
+
+[dependencies]
+openmp = "*"
+
+[fortran]
+implicit-typing = false
+implicit-external = false
+source-form = "free"
+
+[preprocess]
+[preprocess.cpp]
+suffixes = ["f90"]

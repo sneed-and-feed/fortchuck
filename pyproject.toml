@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fortchuck"
+version = "0.1.0"
+description = "Zero-allocation, OpenMP-reentrant Modern Fortran 2018 Coupled Box x Stiefel Quasi-Newton Optimizer with Zero-Copy C99 and Python Bindings"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "CC0-1.0" }
+authors = [
+    { name = "Noah Cohen" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+    "Programming Language :: Fortran",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+bench = [
+    "scipy>=1.10.0",
+    "pymanopt>=2.2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/sneed-and-feed/fortchuck"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["fortchuck*"]
+
+[tool.setuptools.package-data]
+fortchuck = ["*.dll", "*.so", "*.dylib"]
+
+[tool.pytest.ini_options]
+pythonpath = ["python", "."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

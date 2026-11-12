@@ -1,0 +1,27 @@
+# Fortran Package Manager & compiler build artifacts
+build/
+*.o
+*.mod
+*.smod
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Python virtual environments, caches & packaging metadata
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+
+# Lean 4 Lake build & Mathlib cache
+formalization/.lake/
+
+# OS & temporary scratch files
+.DS_Store
+Thumbs.db

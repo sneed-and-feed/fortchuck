@@ -1,0 +1,139 @@
+name: CI Matrix
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gfm-math-audit:
+    name: GFM KaTeX Math Compliance (22 Invariant Rules)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run 22-Rule GFM/KaTeX Math Linter (All Repository Markdown Docs)
+        run: |
+          python scripts/audit_gfm_math.py README.md results/blind_benchmark_report.md docs/ARCHITECTURE_SPEC.md docs/research/TOOLCHAIN_AND_STANDARDS.md docs/research/ARXIV_MANIFOLD_SURVEY.md docs/research/ARXIV_COUPLED_BOX_MANIFOLD_SURVEY.md
+
+  fortran-fpm-and-zero-alloc:
+    name: Fortran 2018 Sanitizers, OpenMP & Zero-Alloc Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GFortran, Binutils & OpenBLAS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran binutils libopenblas-dev
+
+      - name: Set up Fortran Package Manager (fpm)
+        uses: fortran-lang/setup-fpm@v6
+        with:
+          version: "0.13.0"
+
+      - name: Run Native Fortran 2018 Suite (Strict Sanitizers + 16-Thread OpenMP)
+        env:
+          OMP_NUM_THREADS: "16"
+        run: |
+          fpm test --compiler gfortran --flag "-std=f2018 -O2 -g -Wall -Wextra -Werror -pedantic -Warray-temporaries -fimplicit-none -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -fopenmp"
+
+      - name: Build Shared C-ABI Library (Pure F2018 & OpenBLAS Dispatch)
+        run: |
+          python scripts/build_shared.py --blas --no-march-native
+          python scripts/build_shared.py --no-march-native
+
+      - name: Verify Zero Heap Allocations & Zero Array Temporaries (nm -u)
+        run: |
+          python scripts/verify_zero_alloc.py
+
+  python-ffi-and-pytest:
+    name: Zero-Copy C99/Python ctypes FFI & Adversarial Guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GFortran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran
+
+      - name: Build C-ABI Shared Library
+        run: |
+          python scripts/build_shared.py --no-march-native
+
+      - name: Install fortchuck & Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,bench]"
+
+      - name: Run Pytest FFI & Pathological Guard Suite
+        run: |
+          pytest -v tests/
+
+  blind-benchmark-smoke:
+    name: Blind Benchmark Referee & Multi-Regime Smoke Gate
+    runs-on: ubuntu-latest
+    needs: [fortran-fpm-and-zero-alloc, python-ffi-and-pytest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GFortran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran
+
+      - name: Build C-ABI Shared Library
+        run: |
+          python scripts/build_shared.py --no-march-native
+
+      - name: Install fortchuck & Benchmark Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,bench]"
+
+      - name: Verify Central Finite-Difference Gradients & Seed Feasibility
+        run: |
+          python -m benchmarks.referee --seeds 101..110
+          python -m benchmarks.referee --seeds 201..210
+
+      - name: Execute Deterministic Blind & Holdout Benchmark Smoke Suite
+        run: |
+          python benchmarks/run_blind_suite.py \
+            --seeds 101 \
+            --holdout-seeds 201 \
+            --problems B1,B2B,B3,B6,B7A,B7B \
+            --solvers fortchuck,fortchuck-ABB,Alternating-BCD,SciPy-L-BFGS-B \
+            --json-out /tmp/ci_blind_smoke.json \
+            --md-out /tmp/ci_blind_smoke.md
+          python scripts/audit_gfm_math.py /tmp/ci_blind_smoke.md
+          python -c "import json; d = json.load(open('/tmp/ci_blind_smoke.json')); assert d['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['overall_by_solver']['fortchuck']; assert d['holdout']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['holdout']['overall_by_solver']['fortchuck']; assert d['by_problem']['B6']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B6']['fortchuck']; assert d['by_problem']['B7B']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B7B']['fortchuck']; assert d['holdout']['by_problem']['B6']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['holdout']['by_problem']['B6']['fortchuck']"

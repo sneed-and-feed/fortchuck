@@ -144,6 +144,7 @@ def build_shared_library(
         compile_flags.append("-march=native")
     compile_flags.extend(
         [
+            "-funroll-loops",
             "-Wall",
             "-Wextra",
             "-Werror",
@@ -157,7 +158,7 @@ def build_shared_library(
     if use_blas:
         compile_flags.append("-DFORTCHUCK_USE_BLAS")
 
-    link_flags = ["-shared", "-fPIC", "-O3"]
+    link_flags = ["-shared", "-fPIC", "-O3", "-funroll-loops"]
     if march_native:
         link_flags.append("-march=native")
     link_flags.append("-fopenmp")

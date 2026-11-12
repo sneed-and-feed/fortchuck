@@ -26,6 +26,24 @@ module coupled_test_callbacks
     integer(i32) :: calls = 0_i32
   end type barrier_ctx_t
 
+  type :: knapsack_ctx_t
+    real(dp) :: w_quad(10)
+    real(dp) :: z_targ(10)
+    real(dp) :: a_shift(10)
+    real(dp) :: shift_scale = 0.0_dp
+  end type knapsack_ctx_t
+
+  type :: lin_coupled_ctx_t
+    real(dp) :: z_targ(8)
+    real(dp) :: a_vec(8)
+    real(dp) :: shift_scale = 0.0_dp
+  end type lin_coupled_ctx_t
+
+  type :: fm13_ctx_t
+    real(dp) :: M(8, 8)
+    real(dp) :: z_targ(8)
+  end type fm13_ctx_t
+
 contains
 
   !---------------------------------------------------------------------------
@@ -454,30 +472,202 @@ contains
     rc = 0_i32
   end function cb_barrier_or_abort
 
+  !---------------------------------------------------------------------------
+  ! 6a. Pure Weighted Knapsack / Simplex (d = 10, R = 0) with optional shift
+  !     f(z) = 0.5 * sum_i w_i * (z_i - z_targ_i)^2 + shift_scale * (a^T z)
+  !---------------------------------------------------------------------------
+  function cb_knapsack10(d, R, n_arr, p_arr, z, X_packed, &
+      f_out, gz_out, GX_packed_out, udata) bind(C) result(rc)
+    integer(c_int32_t), value, intent(in) :: d, R
+    integer(c_int32_t), intent(in)        :: n_arr(*), p_arr(*)
+    real(c_double), intent(in)            :: z(*), X_packed(*)
+    real(c_double), intent(out)           :: f_out
+    real(c_double), intent(inout)         :: gz_out(*), GX_packed_out(*)
+    type(c_ptr), value, intent(in)        :: udata
+    integer(c_int32_t)                    :: rc
+
+    type(knapsack_ctx_t), pointer :: ctx
+    integer(i32)                  :: i
+    real(dp)                      :: di
+
+    if (.false. .and. R == 0_i32 .and. n_arr(1) == 0_i32 .and. p_arr(1) == 0_i32) continue
+    if (.false. .and. X_packed(1) > 0.0_dp .and. GX_packed_out(1) > 0.0_dp) continue
+
+    call c_f_pointer(udata, ctx)
+    f_out = 0.0_dp
+    do i = 1_i32, d
+      di        = z(i) - ctx%z_targ(i)
+      f_out     = f_out + 0.5_dp * ctx%w_quad(i) * di * di + &
+                  ctx%shift_scale * ctx%a_shift(i) * z(i)
+      gz_out(i) = ctx%w_quad(i) * di + ctx%shift_scale * ctx%a_shift(i)
+    end do
+    rc = 0_i32
+  end function cb_knapsack10
+
+  !---------------------------------------------------------------------------
+  ! 6b. Linearly Constrained Coupled Box x Multi-Stiefel:
+  !     {z in [l, u]^8 : a^T z = b} x St(10, 2) x St(4, 4)
+  !---------------------------------------------------------------------------
+  function cb_lin_coupled_multi(d, R, n_arr, p_arr, z, X_packed, &
+      f_out, gz_out, GX_packed_out, udata) bind(C) result(rc)
+    integer(c_int32_t), value, intent(in) :: d, R
+    integer(c_int32_t), intent(in)        :: n_arr(*), p_arr(*)
+    real(c_double), intent(in)            :: z(*), X_packed(*)
+    real(c_double), intent(out)           :: f_out
+    real(c_double), intent(inout)         :: gz_out(*), GX_packed_out(*)
+    type(c_ptr), value, intent(in)        :: udata
+    integer(c_int32_t)                    :: rc
+
+    type(lin_coupled_ctx_t), pointer :: ctx
+    integer(i32)                     :: i, j, idx
+    real(dp)                         :: di, xij, lam1, lam2, s1, s2
+
+    if (.false. .and. d == 0_i32 .and. R == 0_i32) continue
+    if (.false. .and. n_arr(1) == 0_i32 .and. p_arr(1) == 0_i32) continue
+
+    call c_f_pointer(udata, ctx)
+    f_out = 0.0_dp
+    do i = 1_i32, 8_i32
+      di        = z(i) - ctx%z_targ(i)
+      f_out     = f_out + 0.5_dp * (2.5_dp + real(i, dp)) * di * di + &
+                  ctx%shift_scale * ctx%a_vec(i) * z(i)
+      gz_out(i) = (2.5_dp + real(i, dp)) * di + ctx%shift_scale * ctx%a_vec(i)
+    end do
+
+    ! Factor 1: St(10, 2) coupled with z(1..4)
+    idx = 0_i32
+    s1  = 0.0_dp
+    do j = 1_i32, 2_i32
+      do i = 1_i32, 10_i32
+        idx                = idx + 1_i32
+        xij                = X_packed(idx)
+        lam1               = 0.7_dp * real(i, dp) + 0.2_dp * real(j, dp)
+        f_out              = f_out + 0.5_dp * (0.5_dp + z(j)) * lam1 * xij * xij
+        gz_out(j)          = gz_out(j) + 0.5_dp * lam1 * xij * xij
+        GX_packed_out(idx) = (0.5_dp + z(j)) * lam1 * xij
+      end do
+      s1 = s1 + X_packed((j - 1_i32) * 10_i32 + j)
+      f_out                = f_out - 0.4_dp * z(2_i32 + j) * X_packed((j - 1_i32) * 10_i32 + j)
+      gz_out(2_i32 + j)    = gz_out(2_i32 + j) - 0.4_dp * X_packed((j - 1_i32) * 10_i32 + j)
+      GX_packed_out((j - 1_i32) * 10_i32 + j) = &
+        GX_packed_out((j - 1_i32) * 10_i32 + j) - 0.4_dp * z(2_i32 + j)
+    end do
+
+    ! Factor 2: St(4, 4) coupled with z(5..8)
+    idx = 20_i32
+    s2  = 0.0_dp
+    do j = 1_i32, 4_i32
+      do i = 1_i32, 4_i32
+        idx  = idx + 1_i32
+        lam2 = 0.25_dp * real(i + j, dp)
+        if (i == j) then
+          di = X_packed(idx) - 1.0_dp
+        else
+          di = X_packed(idx)
+        end if
+        f_out              = f_out + 0.5_dp * (0.8_dp + 0.5_dp * z(4_i32 + j)) * lam2 * di * di
+        gz_out(4_i32 + j)  = gz_out(4_i32 + j) + 0.25_dp * lam2 * di * di
+        GX_packed_out(idx) = (0.8_dp + 0.5_dp * z(4_i32 + j)) * lam2 * di
+      end do
+      s2 = s2 + X_packed(20_i32 + (j - 1_i32) * 4_i32 + j)
+    end do
+
+    ! Trilinear coupling across z(6), St(10, 2), and St(4, 4)
+    f_out     = f_out + 0.25_dp * z(6) * s1 * s2
+    gz_out(6) = gz_out(6) + 0.25_dp * s1 * s2
+    do j = 1_i32, 2_i32
+      idx                = (j - 1_i32) * 10_i32 + j
+      GX_packed_out(idx) = GX_packed_out(idx) + 0.25_dp * z(6) * s2
+    end do
+    do j = 1_i32, 4_i32
+      idx                = 20_i32 + (j - 1_i32) * 4_i32 + j
+      GX_packed_out(idx) = GX_packed_out(idx) + 0.25_dp * z(6) * s1
+    end do
+
+    rc = 0_i32
+  end function cb_lin_coupled_multi
+
+  !---------------------------------------------------------------------------
+  ! 6c. FM-13 Ill-Conditioned (kappa = 10^4) Simplex Corner Release Test on
+  !     Delta_8 x St(10, 3) initialized right at suboptimal vertex e_1
+  !---------------------------------------------------------------------------
+  function cb_fm13_simplex_corner(d, R, n_arr, p_arr, z, X_packed, &
+      f_out, gz_out, GX_packed_out, udata) bind(C) result(rc)
+    integer(c_int32_t), value, intent(in) :: d, R
+    integer(c_int32_t), intent(in)        :: n_arr(*), p_arr(*)
+    real(c_double), intent(in)            :: z(*), X_packed(*)
+    real(c_double), intent(out)           :: f_out
+    real(c_double), intent(inout)         :: gz_out(*), GX_packed_out(*)
+    type(c_ptr), value, intent(in)        :: udata
+    integer(c_int32_t)                    :: rc
+
+    type(fm13_ctx_t), pointer :: ctx
+    real(dp)                  :: dz(8), Mdz(8), xij, lam_ij
+    integer(i32)              :: i, j, idx
+
+    if (.false. .and. d == 0_i32 .and. R == 0_i32) continue
+    if (.false. .and. n_arr(1) == 0_i32 .and. p_arr(1) == 0_i32) continue
+
+    call c_f_pointer(udata, ctx)
+    do i = 1_i32, 8_i32
+      dz(i) = z(i) - ctx%z_targ(i)
+    end do
+
+    f_out = 0.0_dp
+    do i = 1_i32, 8_i32
+      Mdz(i) = 0.0_dp
+      do j = 1_i32, 8_i32
+        Mdz(i) = Mdz(i) + ctx%M(i, j) * dz(j)
+      end do
+      f_out     = f_out + 0.5_dp * dz(i) * Mdz(i)
+      gz_out(i) = Mdz(i)
+    end do
+
+    ! Coupled St(10, 3) term modulated by z(2..4)
+    idx = 0_i32
+    do j = 1_i32, 3_i32
+      do i = 1_i32, 10_i32
+        idx                = idx + 1_i32
+        xij                = X_packed(idx)
+        lam_ij             = 0.6_dp * real(i, dp) + 0.25_dp * real(j, dp)
+        f_out              = f_out + 0.5_dp * (0.4_dp + z(1_i32 + j)) * lam_ij * xij * xij
+        gz_out(1_i32 + j)  = gz_out(1_i32 + j) + 0.5_dp * lam_ij * xij * xij
+        GX_packed_out(idx) = (0.4_dp + z(1_i32 + j)) * lam_ij * xij
+      end do
+    end do
+
+    rc = 0_i32
+  end function cb_fm13_simplex_corner
+
 end module coupled_test_callbacks
 
 program test_coupled_solver
   use, intrinsic :: iso_c_binding, only: c_loc, c_funloc, c_null_ptr, c_null_funptr
-  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_positive_inf
+  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_positive_inf, ieee_quiet_nan
   use fortchuck, only: &
     dp, i32, i64, FC_HUGE, &
     FC_SUCCESS_QUERY, FC_CONVERGED_GRAD, FC_CONVERGED_FTOL, FC_CONVERGED_XTOL, &
     FC_MAX_ITER_REACHED, FC_MAX_EVAL_REACHED, &
     FC_ERR_INVALID_DIM, FC_ERR_NULL_PTR, FC_ERR_INVALID_BOUNDS, FC_ERR_INVALID_X0, &
     FC_ERR_WORK_TOO_SMALL, FC_ERR_CALLBACK_NAN, FC_ERR_CALLBACK_ABORT, &
-    FC_ERR_INVALID_OPTS, &
+    FC_ERR_INVALID_OPTS, FC_ERR_INFEASIBLE_LIN, &
     FC_METRIC_CANONICAL, FC_METRIC_EUCLIDEAN, &
     FC_DAMP_CAUTIOUS, FC_DAMP_POWELL, &
     fc_options_t, fc_result_t, fc_init_default_options, &
-    fc_workspace_query, fc_solve, &
+    fc_workspace_query, fc_solve, fc_solve_constrained, &
+    fc_project_linear_box, fc_kkt_residual_constrained, &
     fortchuck_default_options, fortchuck_workspace_query, fortchuck_solve, &
-    fortchuck_project_stiefel, fortchuck_kkt_residual
+    fortchuck_solve_constrained, fortchuck_project_stiefel, &
+    fortchuck_project_linear_box, fortchuck_kkt_residual, &
+    fortchuck_kkt_residual_constrained
   use fortchuck_linalg, only: fc_gemm_nn, fc_gemm_nt, fc_lu_factor, fc_lu_solve, fc_geqrf_pos
   use fortchuck_stiefel, only: fc_stiefel_orth_err
   use coupled_test_callbacks, only: &
     ky_fan_ctx_t, so5_ctx_t, brockett12_ctx_t, barrier_ctx_t, &
+    knapsack_ctx_t, lin_coupled_ctx_t, fm13_ctx_t, &
     cb_pure_box12, cb_sphere10, cb_brockett12, cb_so5_wahba, &
-    cb_coupled_multi, cb_ky_fan_brockett, cb_fm2_multiplier, cb_barrier_or_abort
+    cb_coupled_multi, cb_ky_fan_brockett, cb_fm2_multiplier, cb_barrier_or_abort, &
+    cb_knapsack10, cb_lin_coupled_multi, cb_fm13_simplex_corner
   implicit none (type, external)
 
   integer(i32) :: rng_state
@@ -489,6 +679,7 @@ program test_coupled_solver
   call test_multifactor_coupled_solver()
   call test_ky_fan_box_coupled_brockett_and_modes()
   call test_fm2_guards_and_c_abi_errors()
+  call test_constrained_linear_box_and_fm13()
 
   write (*, '(A)') '[PASS] test_coupled_solver: all assertions passed.'
 
@@ -506,8 +697,8 @@ contains
   function next_rand(state) result(u)
     integer(i32), intent(inout) :: state
     real(dp)                    :: u
-    integer(8)                  :: s64
-    s64   = mod(int(state, 8) * 48271_8, 2147483647_8)
+    integer(i64)                :: s64
+    s64   = mod(int(state, i64) * 48271_i64, 2147483647_i64)
     state = int(s64, i32)
     u     = 2.0_dp * (real(s64, dp) / 2147483647.0_dp) - 1.0_dp
   end function next_rand
@@ -1043,5 +1234,324 @@ contains
       c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res))
     call check_true(st == FC_ERR_INVALID_OPTS, 'c1_armijo >= 1 -> FC_ERR_INVALID_OPTS')
   end subroutine test_fm2_guards_and_c_abi_errors
+
+  !---------------------------------------------------------------------------
+  ! 6. v0.2.0 Linearly Constrained Box + Multi-Stiefel, C-ABI Wrappers,
+  !    Shift-Invariance, FM-13 Simplex Corner Release, and FC_ERR_INFEASIBLE_LIN
+  !---------------------------------------------------------------------------
+  subroutine test_constrained_linear_box_and_fm13()
+    ! 6a: Pure weighted knapsack (d = 10, R = 0)
+    integer(i32), parameter          :: d10 = 10_i32
+    real(dp), target                 :: z10_0(10), z10_f(10), z10_c(10), z10_p(10), l10(10), u10(10)
+    real(dp), target                 :: a10(10), gz10(10), nu_out, kkt_c, lin_c, orth_c
+    real(dp)                         :: dummy_X(1), dummy_GX(1), b10, f_chk, az_sum
+    integer(i32), target             :: dummy_n(1), iw_q(1)
+    integer(i32), allocatable, target :: iwork(:)
+    real(dp), allocatable, target    :: work(:)
+    real(dp), target                 :: w_q(1)
+    type(knapsack_ctx_t), target     :: kctx
+    type(fc_options_t), target       :: opts
+    type(fc_result_t), target        :: res_f, res_c
+
+    ! 6b: Coupled {z in [l, u]^8 : a^T z = b} x St(10, 2) x St(4, 4)
+    integer(i32), target             :: n_m(2), p_m(2)
+    real(dp), target                 :: z8_0(8), z8(8), z8_ref(8), l8(8), u8(8), a8(8)
+    real(dp), target                 :: X36_0(36), X36(36), gz8(8), GX36(36)
+    type(lin_coupled_ctx_t), target  :: lctx
+    real(dp)                         :: b8, f_base, kkt_f, lin_f, orth_f
+
+    ! 6c: FM-13 ill-conditioned (kappa = 1e4) simplex corner release on Delta_8 x St(10, 3)
+    integer(i32)                     :: n_fm13(1), p_fm13(1)
+    real(dp)                         :: z_fm13(8), l_fm13(8), u_fm13(8), a_ones8(8), X_fm13(30)
+    real(dp)                         :: Q8(8, 8), MQ8(8, 8), tau8(8), w8(8), eigs8(8)
+    type(fm13_ctx_t), target         :: fm13_ctx
+
+    ! 6d: Error codes & NaN checks
+    real(dp), target                 :: a_bad(10)
+    real(dp)                         :: qnan
+    integer(i64)                     :: lwork_q, liwork_q
+    integer(i32)                     :: st, rc, info, i, j, m_idx
+    integer(i32)                     :: damps(4), mems(4)
+
+    qnan       = ieee_value(1.0_dp, ieee_quiet_nan)
+    dummy_n(1) = 1_i32
+    dummy_X(1) = 0.0_dp
+    dummy_GX(1)= 0.0_dp
+
+    ! --- 6a. Pure Weighted Knapsack (R = 0, signed non-unit a, fixed l_5 == u_5) ---
+    l10 = [0.0_dp, 0.0_dp, -0.5_dp, 0.1_dp,  0.45_dp, -1.0_dp, 0.0_dp, 0.2_dp, -0.4_dp, 0.0_dp]
+    u10 = [1.5_dp, 1.2_dp,  1.0_dp, 2.0_dp,  0.45_dp,  0.8_dp, 1.0_dp, 1.8_dp,  0.9_dp, 1.4_dp]
+    a10 = [1.5_dp, 0.8_dp, -1.2_dp, 2.0_dp,  1.10_dp, -0.7_dp, 0.5_dp, 1.3_dp, -0.9_dp, 1.0_dp]
+    b10 = 2.35_dp
+
+    do i = 1_i32, d10
+      kctx%w_quad(i)  = 1.5_dp + 0.8_dp * real(i, dp)
+      kctx%a_shift(i) = a10(i)
+    end do
+    kctx%z_targ      = [2.2_dp, -0.6_dp, 1.5_dp, 0.9_dp, 0.0_dp, -1.5_dp, 0.4_dp, 1.1_dp, 0.2_dp, 2.0_dp]
+    kctx%shift_scale = 0.0_dp
+
+    allocate (work(32768), iwork(2048))
+
+    ! Verify fortchuck_project_linear_box (both nu_out != NULL and nu_out == NULL)
+    call fill_rand_vec(d10, z10_0, rng_state)
+    z10_0(5) = 9.0_dp
+    z10_p    = z10_0
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a10(1)), b10, c_loc(z10_p(1)), c_loc(nu_out))
+    call check_true(st == FC_SUCCESS_QUERY, 'fortchuck_project_linear_box status==0')
+    az_sum = sum(a10 * z10_p)
+    call check_true(abs(az_sum - b10) <= 1.0e-14_dp, 'fortchuck_project_linear_box |a^Tz - b| <= 1e-14')
+    call check_true(abs(z10_p(5) - 0.45_dp) <= 1.0e-16_dp, 'fortchuck_project_linear_box fixed z(5)==0.45')
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a10(1)), b10, c_loc(z10_p(1)), c_null_ptr)
+    call check_true(st == FC_SUCCESS_QUERY, 'fortchuck_project_linear_box nu_out==NULL status==0')
+
+    ! Native fc_project_linear_box parity on identical unprojected input z10_0
+    z10_f = z10_0
+    call fc_project_linear_box(d10, l10, u10, a10, b10, z10_f, f_chk, st)
+    call check_true(st == FC_SUCCESS_QUERY .and. abs(f_chk - nu_out) <= 1.0e-13_dp .and. &
+      maxval(abs(z10_f - z10_p)) <= 1.0e-15_dp, 'fc_project_linear_box nu & z parity')
+
+    ! Solve via Fortran fc_solve_constrained and C-ABI fortchuck_solve_constrained (R = 0, NULL Stiefel)
+    call fill_rand_vec(d10, z10_f, rng_state)
+    z10_c = z10_f
+    call fc_init_default_options(opts)
+    opts%gtol = 1.0e-11_dp
+
+    call fc_workspace_query(d10, 0_i32, dummy_n, dummy_n, opts%memory, lwork_q, liwork_q, st)
+    call check_true(st == FC_SUCCESS_QUERY, 'Knapsack R=0 workspace query')
+
+    ! C-ABI query mode lwork == -1 on fortchuck_solve_constrained
+    st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_null_ptr, c_null_ptr, c_null_ptr, c_null_ptr, b10, c_null_ptr, &
+      c_null_funptr, c_null_ptr, c_loc(opts), &
+      c_loc(w_q(1)), -1_i64, c_loc(iw_q(1)), -1_i64, c_loc(res_c))
+    call check_true(st == FC_SUCCESS_QUERY .and. int(w_q(1), i64) == lwork_q .and. &
+      int(iw_q(1), i64) == liwork_q, 'fortchuck_solve_constrained lwork=-1 query')
+
+    call fc_solve_constrained(d10, 0_i32, dummy_n, dummy_n, z10_f, l10, u10, a10, b10, &
+      dummy_X, cb_knapsack10, c_loc(kctx), opts, work, lwork_q, iwork, liwork_q, res_f)
+    call check_true(res_f%status == FC_CONVERGED_GRAD, 'Knapsack native fc_solve_constrained CONVERGED')
+    call check_true(res_f%kkt_residual <= 1.0e-10_dp, 'Knapsack E_KKT <= 1e-10')
+    call check_true(abs(sum(a10 * z10_f) - b10) <= 1.0e-14_dp, 'Knapsack |a^Tz* - b| <= 1e-14')
+
+    st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_loc(a10(1)), b10, c_null_ptr, &
+      c_funloc(cb_knapsack10), c_loc(kctx), c_loc(opts), &
+      c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
+    call check_true(st == FC_CONVERGED_GRAD, 'Knapsack C-ABI fortchuck_solve_constrained CONVERGED')
+    call check_true(abs(res_f%f_val - res_c%f_val) <= 1.0e-15_dp, 'Knapsack Fortran == C-ABI parity')
+
+    ! Verify fortchuck_kkt_residual_constrained (including lwork == -1 query)
+    st = fortchuck_kkt_residual_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_null_ptr, c_null_ptr, c_null_ptr, c_null_ptr, b10, c_null_ptr, &
+      c_null_ptr, c_null_ptr, FC_METRIC_CANONICAL, &
+      c_loc(w_q(1)), -1_i64, c_null_ptr, c_null_ptr, c_null_ptr)
+    call check_true(st == FC_SUCCESS_QUERY .and. int(w_q(1), i32) == d10, &
+      'fortchuck_kkt_residual_constrained R=0 lwork=-1 == d')
+
+    rc = cb_knapsack10(d10, 0_i32, dummy_n, dummy_n, z10_c, dummy_X, f_chk, gz10, dummy_GX, c_loc(kctx))
+    call check_true(rc == 0_i32, 'Knapsack callback check')
+    st = fortchuck_kkt_residual_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_loc(a10(1)), b10, c_null_ptr, &
+      c_loc(gz10(1)), c_null_ptr, FC_METRIC_CANONICAL, &
+      c_loc(work(1)), lwork_q, c_loc(kkt_c), c_loc(lin_c), c_loc(orth_c))
+    call check_true(st == FC_SUCCESS_QUERY, 'fortchuck_kkt_residual_constrained R=0 status==0')
+    call check_true(abs(kkt_c - res_c%kkt_residual) <= 1.0e-14_dp, 'Knapsack KKT residual match')
+    call check_true(lin_c <= 1.0e-14_dp .and. abs(orth_c) <= 1.0e-16_dp, &
+      'Knapsack lin_err <= 1e-14, orth==0')
+
+    ! --- 6b. Coupled Constrained Box x St(10, 2) x St(4, 4) (a = 1 & weighted a != 1 + shift invariance) ---
+    n_m = [10_i32, 4_i32]
+    p_m = [ 2_i32, 4_i32]
+    l8  = [0.0_dp, 0.0_dp, 0.35_dp, 0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp]
+    u8  = [1.0_dp, 1.0_dp, 0.35_dp, 1.0_dp, 1.0_dp, 1.0_dp, 1.0_dp, 1.0_dp]
+    lctx%z_targ = [-0.4_dp, 1.6_dp, 0.35_dp, 0.55_dp, 0.75_dp, -0.8_dp, 0.45_dp, 1.3_dp]
+
+    call fill_rand_vec(8_i32, z8_0, rng_state)
+    call fill_rand_vec(36_i32, X36_0, rng_state)
+
+    ! First test trace constraint a = 1, b = 3.25 across CAUTIOUS/POWELL and m=7/m=0
+    a8          = 1.0_dp
+    b8          = 3.25_dp
+    lctx%a_vec  = a8
+    lctx%shift_scale = 0.0_dp
+    damps = [FC_DAMP_CAUTIOUS, FC_DAMP_POWELL, FC_DAMP_CAUTIOUS, FC_DAMP_POWELL]
+    mems  = [7_i32, 7_i32, 0_i32, 0_i32]
+
+    do m_idx = 1_i32, 4_i32
+      call fc_init_default_options(opts)
+      opts%gtol         = 1.0e-9_dp
+      opts%damping_mode = damps(m_idx)
+      opts%memory       = mems(m_idx)
+      opts%max_iter     = 2000_i32
+      opts%max_eval     = 8000_i32
+      call fc_workspace_query(8_i32, 2_i32, n_m, p_m, opts%memory, lwork_q, liwork_q, st)
+      z8  = z8_0
+      X36 = X36_0
+      call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+        cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_f)
+      call check_true(res_f%status == FC_CONVERGED_GRAD, 'Trace-coupled Multi-Stiefel CONVERGED')
+      call check_true(res_f%kkt_residual <= 1.0e-9_dp, 'Trace-coupled Multi-Stiefel E_KKT <= 1e-9')
+      call check_true(res_f%orth_error <= 1.0e-13_dp, 'Trace-coupled Multi-Stiefel orth <= 1e-13')
+      call check_true(abs(sum(z8) - b8) <= 1.0e-14_dp, 'Trace-coupled |1^Tz - b| <= 1e-14')
+      call check_true(abs(z8(3) - 0.35_dp) <= 1.0e-16_dp, 'Trace-coupled fixed z(3)==0.35')
+    end do
+
+    ! Second test general non-unit signed weights a != 1 AND shift invariance gz -> gz + 1e6 * a!
+    a8          = [1.4_dp, 0.9_dp, 1.2_dp, -0.8_dp, 1.7_dp, -0.5_dp, 1.1_dp, 0.6_dp]
+    b8          = 2.15_dp
+    lctx%a_vec  = a8
+    lctx%shift_scale = 0.0_dp
+    call fc_init_default_options(opts)
+    opts%gtol   = 1.0e-9_dp
+    call fc_workspace_query(8_i32, 2_i32, n_m, p_m, opts%memory, lwork_q, liwork_q, st)
+
+    z8  = z8_0
+    X36 = X36_0
+    call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+      cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_f)
+    call check_true(res_f%status == FC_CONVERGED_GRAD, 'Weighted-coupled a/=1 CONVERGED')
+    call check_true(abs(sum(a8 * z8) - b8) <= 1.0e-14_dp, 'Weighted-coupled |a^Tz - b| <= 1e-14')
+    z8_ref = z8
+    f_base = res_f%f_val
+
+    ! Check fc_kkt_residual_constrained + C-ABI lwork=-1 query on R=2 (max_r(nr*pr + 3*pr^2) = max(32, 64) = 64 -> 8+64 = 72)
+    st = fortchuck_kkt_residual_constrained(8_i32, 2_i32, c_loc(n_m(1)), c_loc(p_m(1)), &
+      c_null_ptr, c_null_ptr, c_null_ptr, c_null_ptr, b8, c_null_ptr, &
+      c_null_ptr, c_null_ptr, FC_METRIC_CANONICAL, &
+      c_loc(w_q(1)), -1_i64, c_null_ptr, c_null_ptr, c_null_ptr)
+    call check_true(st == FC_SUCCESS_QUERY .and. int(w_q(1), i32) == 72_i32, &
+      'fortchuck_kkt_residual_constrained R=2 lwork=-1 == 72')
+
+    rc = cb_lin_coupled_multi(8_i32, 2_i32, n_m, p_m, z8, X36, f_chk, gz8, GX36, c_loc(lctx))
+    call check_true(rc == 0_i32, 'Weighted-coupled callback check')
+    call fc_kkt_residual_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+      gz8, GX36, opts%metric, work, 72_i64, kkt_f, lin_f, orth_f, st)
+    call check_true(st == FC_SUCCESS_QUERY .and. abs(kkt_f - res_f%kkt_residual) <= 1.0e-14_dp, &
+      'fc_kkt_residual_constrained exact 72-double lwork match')
+
+    ! Shift-invariance tests:
+    ! (i) shift_scale = 1e4 with default ftol and gtol = 1e-9 (within 53-bit f_out precision)
+    lctx%shift_scale = 1.0e4_dp
+    z8  = z8_0
+    X36 = X36_0
+    call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+      cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_c)
+    call check_true(res_c%status == FC_CONVERGED_GRAD, 'Shift-invariant 1e4*a CONVERGED_GRAD')
+    call check_true(maxval(abs(z8 - z8_ref)) <= 1.0e-8_dp, 'Shift-invariant 1e4*a z* == z*_ref')
+    call check_true(abs((res_c%f_val - 1.0e4_dp * b8) - f_base) <= 1.0e-9_dp, &
+      'Shift-invariant 1e4*a f* - 1e4*b == f*_base')
+
+    ! (ii) Extreme shift_scale = 1e6 where 1 ULP(f) ~ 4.7e-10 (ftol=0 exercises sub-ULP Hermite LS!)
+    lctx%shift_scale = 1.0e6_dp
+    opts%ftol        = 0.0_dp
+    opts%gtol        = 1.0e-8_dp
+    z8  = z8_0
+    X36 = X36_0
+    call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+      cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_c)
+    call check_true(res_c%status == FC_CONVERGED_GRAD, 'Shift-invariant 1e6*a (ftol=0) CONVERGED_GRAD')
+    call check_true(maxval(abs(z8 - z8_ref)) <= 1.0e-7_dp, 'Shift-invariant 1e6*a z* == z*_ref')
+
+    ! --- 6c. FM-13 Ill-Conditioned (kappa = 10^4) Simplex Corner Release Test ---
+    ! Initialized directly at suboptimal vertex e_1 = [1, 0, ..., 0] on Delta_8 x St(10, 3)!
+    n_fm13  = [10_i32]
+    p_fm13  = [ 3_i32]
+    l_fm13  = 0.0_dp
+    u_fm13  = 1.0_dp
+    a_ones8 = 1.0_dp
+
+    do j = 1_i32, 8_i32
+      eigs8(j) = 10.0_dp**(4.0_dp * real(j - 1_i32, dp) / 7.0_dp)
+    end do
+    call fill_rand_vec(64_i32, Q8, rng_state)
+    call fc_geqrf_pos(8_i32, 8_i32, Q8, tau8, w8, info)
+    do j = 1_i32, 8_i32
+      do i = 1_i32, 8_i32
+        MQ8(i, j) = Q8(i, j) * eigs8(j)
+      end do
+    end do
+    call fc_gemm_nt(8_i32, 8_i32, 8_i32, 1.0_dp, MQ8, 8_i32, Q8, 8_i32, 0.0_dp, fm13_ctx%M, 8_i32)
+    do j = 1_i32, 8_i32
+      do i = 1_i32, j - 1_i32
+        fm13_ctx%M(i, j) = 0.5_dp * (fm13_ctx%M(i, j) + fm13_ctx%M(j, i))
+        fm13_ctx%M(j, i) = fm13_ctx%M(i, j)
+      end do
+    end do
+    ! Optimal simplex point puts mass on coordinates 3..6 and 0 on suboptimal vertex 1
+    fm13_ctx%z_targ = [-0.5_dp, -0.3_dp, 0.35_dp, 0.30_dp, 0.25_dp, 0.20_dp, -0.2_dp, -0.2_dp]
+
+    z_fm13    = 0.0_dp
+    z_fm13(1) = 1.0_dp  ! Suboptimal vertex e_1 where d - 1 = 7 bounds are active!
+    call fill_rand_vec(30_i32, X_fm13, rng_state)
+
+    call fc_init_default_options(opts)
+    opts%gtol     = 1.0e-9_dp
+    opts%max_iter = 2000_i32
+    opts%max_eval = 8000_i32
+    call fc_workspace_query(8_i32, 1_i32, n_fm13, p_fm13, opts%memory, lwork_q, liwork_q, st)
+    call fc_solve_constrained(8_i32, 1_i32, n_fm13, p_fm13, z_fm13, l_fm13, u_fm13, &
+      a_ones8, 1.0_dp, X_fm13, cb_fm13_simplex_corner, c_loc(fm13_ctx), &
+      opts, work, lwork_q, iwork, liwork_q, res_f)
+    call check_true(res_f%status == FC_CONVERGED_GRAD, 'FM-13 simplex corner release CONVERGED_GRAD')
+    call check_true(res_f%kkt_residual <= 1.0e-9_dp, 'FM-13 simplex corner E_KKT <= 1e-9')
+    call check_true(abs(sum(z_fm13) - 1.0_dp) <= 1.0e-14_dp, 'FM-13 simplex |1^Tz* - 1| <= 1e-14')
+    call check_true(z_fm13(1) < 0.25_dp, 'FM-13 released suboptimal corner e_1')
+
+    ! --- 6d. Constrained Error Codes (FC_ERR_INFEASIBLE_LIN = -10, NULL, DIM, X0) ---
+    ! Unreachable b > b_max -> FC_ERR_INFEASIBLE_LIN
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a10(1)), 999.0_dp, c_loc(z10_p(1)), c_null_ptr)
+    call check_true(st == FC_ERR_INFEASIBLE_LIN, 'b > b_max -> FC_ERR_INFEASIBLE_LIN (-10)')
+
+    st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_loc(a10(1)), -999.0_dp, c_null_ptr, &
+      c_funloc(cb_knapsack10), c_loc(kctx), c_loc(opts), &
+      c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
+    call check_true(st == FC_ERR_INFEASIBLE_LIN, 'solve_constrained b < b_min -> FC_ERR_INFEASIBLE_LIN')
+
+    ! Zero weight vector a == 0 -> FC_ERR_INFEASIBLE_LIN
+    a_bad = 0.0_dp
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a_bad(1)), 0.0_dp, c_loc(z10_p(1)), c_null_ptr)
+    call check_true(st == FC_ERR_INFEASIBLE_LIN, 'a == 0 -> FC_ERR_INFEASIBLE_LIN')
+
+    ! NaN in a or b -> FC_ERR_INFEASIBLE_LIN
+    a_bad    = a10
+    a_bad(3) = qnan
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a_bad(1)), b10, c_loc(z10_p(1)), c_null_ptr)
+    call check_true(st == FC_ERR_INFEASIBLE_LIN, 'NaN in a -> FC_ERR_INFEASIBLE_LIN')
+
+    st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
+      c_loc(a10(1)), qnan, c_loc(z10_p(1)), c_null_ptr)
+    call check_true(st == FC_ERR_INFEASIBLE_LIN, 'NaN in b -> FC_ERR_INFEASIBLE_LIN')
+
+    ! d = 0 -> FC_ERR_INVALID_DIM on constrained APIs
+    st = fortchuck_solve_constrained(0_i32, 1_i32, c_loc(n_m(1)), c_loc(p_m(1)), &
+      c_null_ptr, c_null_ptr, c_null_ptr, c_null_ptr, 0.0_dp, c_loc(X36(1)), &
+      c_funloc(cb_lin_coupled_multi), c_loc(lctx), c_loc(opts), &
+      c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
+    call check_true(st == FC_ERR_INVALID_DIM, 'solve_constrained d=0 -> FC_ERR_INVALID_DIM')
+
+    ! a = NULL -> FC_ERR_NULL_PTR
+    st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_null_ptr, b10, c_null_ptr, &
+      c_funloc(cb_knapsack10), c_loc(kctx), c_loc(opts), &
+      c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
+    call check_true(st == FC_ERR_NULL_PTR, 'solve_constrained a=NULL -> FC_ERR_NULL_PTR')
+
+    ! project_initial = 0 with infeasible a^T z0 /= b -> FC_ERR_INVALID_X0
+    opts%project_initial = 0_i32
+    z10_c = l10
+    z10_c(5) = 0.45_dp
+    st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
+      c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_loc(a10(1)), b10, c_null_ptr, &
+      c_funloc(cb_knapsack10), c_loc(kctx), c_loc(opts), &
+      c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
+    call check_true(st == FC_ERR_INVALID_X0, 'project_initial=0 infeasible a^Tz0 /= b -> FC_ERR_INVALID_X0')
+  end subroutine test_constrained_linear_box_and_fm13
 
 end program test_coupled_solver

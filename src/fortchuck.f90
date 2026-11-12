@@ -6,18 +6,21 @@ module fortchuck
     FC_MAX_ITER_REACHED, FC_MAX_EVAL_REACHED, &
     FC_ERR_INVALID_DIM, FC_ERR_NULL_PTR, FC_ERR_INVALID_BOUNDS, FC_ERR_INVALID_X0, &
     FC_ERR_WORK_TOO_SMALL, FC_ERR_CALLBACK_NAN, FC_ERR_CALLBACK_ABORT, &
-    FC_ERR_LS_FAILED, FC_ERR_INVALID_OPTS, &
+    FC_ERR_LS_FAILED, FC_ERR_INVALID_OPTS, FC_ERR_INFEASIBLE_LIN, &
     FC_METRIC_CANONICAL, FC_METRIC_EUCLIDEAN, &
     FC_DAMP_CAUTIOUS, FC_DAMP_POWELL, &
     FC_BOX_FREE, FC_BOX_ACTIVE, FC_BOX_FIXED, &
     fc_options_t, fc_result_t, fc_eval_fg_cb, &
     fc_init_default_options, fc_init_result
   use fortchuck_solver, only: &
-    fc_validate_options, fc_workspace_query, fc_solve, &
-    fc_project_stiefel, fc_kkt_residual
+    fc_validate_options, fc_workspace_query, fc_solve, fc_solve_constrained, &
+    fc_project_stiefel, fc_project_linear_box, &
+    fc_kkt_residual, fc_kkt_residual_constrained
   use fortchuck_c_abi, only: &
-    fortchuck_default_options, fortchuck_workspace_query, fortchuck_solve, &
-    fortchuck_project_stiefel, fortchuck_kkt_residual
+    fortchuck_default_options, fortchuck_workspace_query, &
+    fortchuck_solve, fortchuck_solve_constrained, &
+    fortchuck_project_stiefel, fortchuck_project_linear_box, &
+    fortchuck_kkt_residual, fortchuck_kkt_residual_constrained
   implicit none (type, external)
   public
 end module fortchuck

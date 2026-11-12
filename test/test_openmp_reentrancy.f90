@@ -96,7 +96,7 @@ program test_openmp_reentrancy
     dp, i32, i64, &
     FC_SUCCESS_QUERY, FC_CONVERGED_GRAD, &
     fc_options_t, fc_result_t, fc_init_default_options, &
-    fc_workspace_query, fc_solve
+    fc_workspace_query, fc_solve, fc_solve_constrained
   use omp_reentrancy_callbacks, only: omp_prob_ctx_t, cb_omp_coupled
   implicit none (type, external)
 
@@ -105,24 +105,22 @@ program test_openmp_reentrancy
   integer(i32), parameter :: D_BOX     = 8_i32
   integer(i32), parameter :: R_ST      = 2_i32
   integer(i32), parameter :: N_ST_TOT  = 52_i32  ! 12*3 + 4*4
-  integer(i32), parameter :: MAX_LWORK = 8192_i32
-  integer(i32), parameter :: MAX_LIWRK = 512_i32
 
-  integer(i32)                :: n_arr(R_ST), p_arr(R_ST)
+  integer(i32)                 :: n_arr(R_ST), p_arr(R_ST)
   type(omp_prob_ctx_t), target :: ctxs(N_INST)
-  real(dp)                    :: l_all(D_BOX, N_INST), u_all(D_BOX, N_INST)
-  real(dp)                    :: z0_all(D_BOX, N_INST), X0_all(N_ST_TOT, N_INST)
-  real(dp)                    :: z_seq(D_BOX, N_INST), X_seq(N_ST_TOT, N_INST)
-  real(dp)                    :: z_par(D_BOX, N_INST), X_par(N_ST_TOT, N_INST)
-  type(fc_result_t)           :: res_seq(N_INST), res_par(N_INST)
-  real(dp)                    :: work_seq(MAX_LWORK)
-  integer(i32)                :: iwork_seq(MAX_LIWRK)
-  real(dp)                    :: work_thr(MAX_LWORK, N_THREADS)
-  integer(i32)                :: iwork_thr(MAX_LIWRK, N_THREADS)
-  type(fc_options_t)          :: opts
-  integer(i64)                :: lwork_q, liwork_q
-  integer(i32)                :: st, inst, tid, i, j, seed
-  real(dp)                    :: max_f_diff, max_z_diff, max_X_diff, d_val
+  real(dp)                     :: l_all(D_BOX, N_INST), u_all(D_BOX, N_INST)
+  real(dp)                     :: a_all(D_BOX, N_INST), b_all(N_INST)
+  real(dp)                     :: z0_all(D_BOX, N_INST), X0_all(N_ST_TOT, N_INST)
+  real(dp)                     :: z_seq(D_BOX, N_INST), X_seq(N_ST_TOT, N_INST)
+  real(dp)                     :: z_par(D_BOX, N_INST), X_par(N_ST_TOT, N_INST)
+  type(fc_result_t)            :: res_seq(N_INST), res_par(N_INST)
+  real(dp), allocatable        :: work_seq(:), work_thr(:, :)
+  integer(i32), allocatable    :: iwork_seq(:), iwork_thr(:, :)
+  type(fc_options_t)           :: opts
+  integer(i64)                 :: lwork_q, liwork_q
+  integer(i32)                 :: st, inst, tid, i, j, seed
+  real(dp)                     :: max_f_diff, max_z_diff, max_X_diff, d_val
+  real(dp)                     :: b_lo, b_hi, dot_az
 
   n_arr = [12_i32, 4_i32]
   p_arr = [ 3_i32, 4_i32]
@@ -133,26 +131,49 @@ program test_openmp_reentrancy
   opts%max_eval = 5000_i32
 
   call fc_workspace_query(D_BOX, R_ST, n_arr, p_arr, opts%memory, lwork_q, liwork_q, st)
-  if (st /= FC_SUCCESS_QUERY .or. lwork_q > int(MAX_LWORK, i64) .or. &
-      liwork_q > int(MAX_LIWRK, i64)) then
-    write (*, '(A)') '[FAIL] OpenMP workspace query out of static arena bounds'
+  if (st /= FC_SUCCESS_QUERY .or. lwork_q < 1_i64 .or. liwork_q < 1_i64) then
+    write (*, '(A)') '[FAIL] OpenMP workspace query failed'
     error stop 1
   end if
+  allocate (work_seq(lwork_q), iwork_seq(liwork_q))
+  allocate (work_thr(lwork_q, N_THREADS), iwork_thr(liwork_q, N_THREADS))
 
-  ! Deterministic per-instance problem & initialization synthesis across 64 seeds
+  ! Deterministic per-instance problem & initialization synthesis across 64 seeds:
+  !   - Odd instances  (1, 3, ..., 63): unconstrained box x Multi-Stiefel via fc_solve
+  !   - Even instances (2, 4, ..., 64): weighted linear-constrained box x Multi-Stiefel
+  !                                     via fc_solve_constrained (non-unit signed weights!)
   do inst = 1_i32, N_INST
     seed = 10007_i32 * inst + 31337_i32
     do i = 1_i32, D_BOX
-      l_all(i, inst)        = 0.1_dp
-      u_all(i, inst)        = 2.0_dp
-      ctxs(inst)%z_targ(i)  = 1.05_dp + 1.4_dp * next_u(seed)
-      ctxs(inst)%z_w(i)     = 2.0_dp + real(i, dp) + next_u(seed)
-      z0_all(i, inst)       = 0.2_dp + 1.6_dp * (0.5_dp * next_u(seed) + 0.5_dp)
+      l_all(i, inst)       = 0.1_dp
+      u_all(i, inst)       = 2.0_dp
+      ctxs(inst)%z_targ(i) = 1.05_dp + 1.4_dp * next_u(seed)
+      ctxs(inst)%z_w(i)    = 2.0_dp + real(i, dp) + next_u(seed)
+      z0_all(i, inst)      = 0.2_dp + 1.6_dp * (0.5_dp * next_u(seed) + 0.5_dp)
+      if (mod(i, 3_i32) == 0_i32) then
+        a_all(i, inst) = -(0.6_dp + 0.4_dp * abs(next_u(seed)))
+      else
+        a_all(i, inst) =  (0.7_dp + 0.8_dp * abs(next_u(seed)))
+      end if
     end do
     ! Coordinate 7 is fixed l_7 == u_7 on every instance
     l_all(7, inst)  = 0.65_dp
     u_all(7, inst)  = 0.65_dp
     z0_all(7, inst) = 0.65_dp
+
+    ! Strictly interior reachable rhs b_all(inst) in (b_min, b_max)
+    b_lo = 0.0_dp
+    b_hi = 0.0_dp
+    do i = 1_i32, D_BOX
+      if (a_all(i, inst) >= 0.0_dp) then
+        b_lo = b_lo + a_all(i, inst) * l_all(i, inst)
+        b_hi = b_hi + a_all(i, inst) * u_all(i, inst)
+      else
+        b_lo = b_lo + a_all(i, inst) * u_all(i, inst)
+        b_hi = b_hi + a_all(i, inst) * l_all(i, inst)
+      end if
+    end do
+    b_all(inst) = b_lo + (0.28_dp + 0.44_dp * (0.5_dp * next_u(seed) + 0.5_dp)) * (b_hi - b_lo)
 
     do j = 1_i32, 3_i32
       do i = 1_i32, 12_i32
@@ -188,10 +209,18 @@ program test_openmp_reentrancy
 
   ! 1. Sequential reference baseline across all 64 instances
   do inst = 1_i32, N_INST
-    call fc_solve(D_BOX, R_ST, n_arr, p_arr, &
-      z_seq(:, inst), l_all(:, inst), u_all(:, inst), X_seq(:, inst), &
-      cb_omp_coupled, c_loc(ctxs(inst)), opts, &
-      work_seq, lwork_q, iwork_seq, liwork_q, res_seq(inst))
+    if (mod(inst, 2_i32) == 1_i32) then
+      call fc_solve(D_BOX, R_ST, n_arr, p_arr, &
+        z_seq(:, inst), l_all(:, inst), u_all(:, inst), X_seq(:, inst), &
+        cb_omp_coupled, c_loc(ctxs(inst)), opts, &
+        work_seq, lwork_q, iwork_seq, liwork_q, res_seq(inst))
+    else
+      call fc_solve_constrained(D_BOX, R_ST, n_arr, p_arr, &
+        z_seq(:, inst), l_all(:, inst), u_all(:, inst), &
+        a_all(:, inst), b_all(inst), X_seq(:, inst), &
+        cb_omp_coupled, c_loc(ctxs(inst)), opts, &
+        work_seq, lwork_q, iwork_seq, liwork_q, res_seq(inst))
+    end if
   end do
 
   ! 2. Concurrent 16-thread OpenMP execution with schedule(dynamic, 1)
@@ -199,15 +228,23 @@ program test_openmp_reentrancy
   tid = int(omp_get_thread_num(), i32) + 1_i32
   !$omp do schedule(dynamic, 1)
   do inst = 1_i32, N_INST
-    call fc_solve(D_BOX, R_ST, n_arr, p_arr, &
-      z_par(:, inst), l_all(:, inst), u_all(:, inst), X_par(:, inst), &
-      cb_omp_coupled, c_loc(ctxs(inst)), opts, &
-      work_thr(:, tid), lwork_q, iwork_thr(:, tid), liwork_q, res_par(inst))
+    if (mod(inst, 2_i32) == 1_i32) then
+      call fc_solve(D_BOX, R_ST, n_arr, p_arr, &
+        z_par(:, inst), l_all(:, inst), u_all(:, inst), X_par(:, inst), &
+        cb_omp_coupled, c_loc(ctxs(inst)), opts, &
+        work_thr(:, tid), lwork_q, iwork_thr(:, tid), liwork_q, res_par(inst))
+    else
+      call fc_solve_constrained(D_BOX, R_ST, n_arr, p_arr, &
+        z_par(:, inst), l_all(:, inst), u_all(:, inst), &
+        a_all(:, inst), b_all(inst), X_par(:, inst), &
+        cb_omp_coupled, c_loc(ctxs(inst)), opts, &
+        work_thr(:, tid), lwork_q, iwork_thr(:, tid), liwork_q, res_par(inst))
+    end if
   end do
   !$omp end do
   !$omp end parallel
 
-  ! 3. Assert 100% convergence AND 0.0_dp bit-for-bit identical reproducibility
+  ! 3. Assert 100% convergence, linear equality satisfaction, AND 0.0_dp diff
   max_f_diff = 0.0_dp
   max_z_diff = 0.0_dp
   max_X_diff = 0.0_dp
@@ -232,6 +269,19 @@ program test_openmp_reentrancy
       error stop 1
     end if
 
+    if (mod(inst, 2_i32) == 0_i32) then
+      dot_az = 0.0_dp
+      do i = 1_i32, D_BOX
+        dot_az = dot_az + a_all(i, inst) * z_par(i, inst)
+      end do
+      if (abs(dot_az - b_all(inst)) > 1.0e-13_dp) then
+        write (*, '(A,I0,A,ES11.3)') &
+          '[FAIL] Constrained OpenMP linear feasibility error on instance ', &
+          inst, ': ', abs(dot_az - b_all(inst))
+        error stop 1
+      end if
+    end if
+
     d_val = abs(res_par(inst)%f_val - res_seq(inst)%f_val)
     if (d_val > max_f_diff) max_f_diff = d_val
 
@@ -252,7 +302,8 @@ program test_openmp_reentrancy
     error stop 1
   end if
 
-  write (*, '(A,ES10.3)') '[PASS] test_openmp_reentrancy: 64 instances x 16 threads max_diff = ', &
+  write (*, '(A,ES10.3)') &
+    '[PASS] test_openmp_reentrancy: 64 mixed (solve + solve_constrained) x 16 threads max_diff = ', &
     max(max_f_diff, max(max_z_diff, max_X_diff))
 
 contains
@@ -260,8 +311,8 @@ contains
   function next_u(state) result(u)
     integer(i32), intent(inout) :: state
     real(dp)                    :: u
-    integer(8)                  :: s64
-    s64   = mod(int(state, 8) * 48271_8, 2147483647_8)
+    integer(i64)                :: s64
+    s64   = mod(int(state, i64) * 48271_i64, 2147483647_i64)
     state = int(s64, i32)
     u     = 2.0_dp * (real(s64, dp) / 2147483647.0_dp) - 1.0_dp
   end function next_u

@@ -34,7 +34,8 @@ contains
 
   !---------------------------------------------------------------------------
   ! C(1:m, 1:n) := alpha * A(1:m, 1:k) * B(1:k, 1:n) + beta * C(1:m, 1:n)
-  ! Cache-friendly j-l-i column-major order for unit-stride SIMD FMA in i.
+  ! L1/L2 cache-tiled (MC=128, NC=64, KC=128) with 1x4 column-unrolled SIMD
+  ! FMA register micro-kernel and unit-stride i inner loop (0 stack arrays).
   !---------------------------------------------------------------------------
   pure subroutine fc_gemm_nn(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
     integer(i32), intent(in) :: m, n, k, lda, ldb, ldc
@@ -42,13 +43,14 @@ contains
     real(dp), intent(in)     :: A(lda, *), B(ldb, *)
     real(dp), intent(inout)  :: C(ldc, *)
 
-    integer(i32) :: i, j, l
-    real(dp)     :: b_lj
+    integer(i32), parameter :: MC = 128_i32, NC = 64_i32, KC = 128_i32
+    integer(i32) :: i, j, l, i0, j0, l0, i_end, j_end, l_end, j_lim4
+    real(dp)     :: b0, b1, b2, b3, a_il
 
     if (m <= 0_i32 .or. n <= 0_i32) return
 
 #ifdef FORTCHUCK_USE_BLAS
-    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 32768_i64) then
+    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 8192_i64) then
       call dgemm('N', 'N', m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
       return
     end if
@@ -70,21 +72,49 @@ contains
 
     if (k <= 0_i32 .or. .not. (abs(alpha) > 0.0_dp)) return
 
-    do j = 1_i32, n
-      do l = 1_i32, k
-        b_lj = alpha * B(l, j)
-        if (abs(b_lj) > 0.0_dp) then
-          do i = 1_i32, m
-            C(i, j) = C(i, j) + A(i, l) * b_lj
+    do j0 = 1_i32, n, NC
+      j_end  = min(j0 + NC - 1_i32, n)
+      j_lim4 = j0 + ((j_end - j0 + 1_i32) / 4_i32) * 4_i32 - 1_i32
+      do l0 = 1_i32, k, KC
+        l_end = min(l0 + KC - 1_i32, k)
+        do i0 = 1_i32, m, MC
+          i_end = min(i0 + MC - 1_i32, m)
+
+          do j = j0, j_lim4, 4_i32
+            do l = l0, l_end
+              b0 = alpha * B(l, j)
+              b1 = alpha * B(l, j + 1_i32)
+              b2 = alpha * B(l, j + 2_i32)
+              b3 = alpha * B(l, j + 3_i32)
+              do i = i0, i_end
+                a_il            = A(i, l)
+                C(i, j)         = C(i, j)         + a_il * b0
+                C(i, j + 1_i32) = C(i, j + 1_i32) + a_il * b1
+                C(i, j + 2_i32) = C(i, j + 2_i32) + a_il * b2
+                C(i, j + 3_i32) = C(i, j + 3_i32) + a_il * b3
+              end do
+            end do
           end do
-        end if
+
+          do j = j_lim4 + 1_i32, j_end
+            do l = l0, l_end
+              b0 = alpha * B(l, j)
+              if (abs(b0) > 0.0_dp) then
+                do i = i0, i_end
+                  C(i, j) = C(i, j) + A(i, l) * b0
+                end do
+              end if
+            end do
+          end do
+        end do
       end do
     end do
   end subroutine fc_gemm_nn
 
   !---------------------------------------------------------------------------
   ! C(1:m, 1:n) := alpha * A(1:k, 1:m)^T * B(1:k, 1:n) + beta * C(1:m, 1:n)
-  ! Inner l = 1..k loop is unit-stride in both A(:, i) and B(:, j).
+  ! L1/L2 cache-tiled (MC=64, NC=64, KC=128) with explicit 4x4 scalar-register
+  ! FMA micro-kernel over unit-stride l (0 stack arrays).
   !---------------------------------------------------------------------------
   pure subroutine fc_gemm_tn(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
     integer(i32), intent(in) :: m, n, k, lda, ldb, ldc
@@ -92,56 +122,133 @@ contains
     real(dp), intent(in)     :: A(lda, *), B(ldb, *)
     real(dp), intent(inout)  :: C(ldc, *)
 
-    integer(i32) :: i, j, l
-    real(dp)     :: acc
-    logical      :: beta_zero
+    integer(i32), parameter :: MC = 64_i32, NC = 64_i32, KC = 128_i32
+    integer(i32) :: i, j, l, i0, j0, l0, i_end, j_end, l_end, i_lim4, j_lim4
+    real(dp)     :: a0, a1, a2, a3, b0, b1, b2, b3
+    real(dp)     :: c00, c10, c20, c30, c01, c11, c21, c31
+    real(dp)     :: c02, c12, c22, c32, c03, c13, c23, c33
 
     if (m <= 0_i32 .or. n <= 0_i32) return
 
 #ifdef FORTCHUCK_USE_BLAS
-    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 32768_i64) then
+    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 8192_i64) then
       call dgemm('T', 'N', m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
       return
     end if
 #endif
 
-    beta_zero = .not. (abs(beta) > 0.0_dp)
-
-    if (k <= 0_i32 .or. .not. (abs(alpha) > 0.0_dp)) then
-      if (beta_zero) then
-        do j = 1_i32, n
-          do i = 1_i32, m
-            C(i, j) = 0.0_dp
-          end do
+    if (.not. (abs(beta) > 0.0_dp)) then
+      do j = 1_i32, n
+        do i = 1_i32, m
+          C(i, j) = 0.0_dp
         end do
-      else if (beta < 1.0_dp .or. beta > 1.0_dp) then
-        do j = 1_i32, n
-          do i = 1_i32, m
-            C(i, j) = beta * C(i, j)
-          end do
+      end do
+    else if (beta < 1.0_dp .or. beta > 1.0_dp) then
+      do j = 1_i32, n
+        do i = 1_i32, m
+          C(i, j) = beta * C(i, j)
         end do
-      end if
-      return
+      end do
     end if
 
-    do j = 1_i32, n
-      do i = 1_i32, m
-        acc = 0.0_dp
-        do l = 1_i32, k
-          acc = acc + A(l, i) * B(l, j)
+    if (k <= 0_i32 .or. .not. (abs(alpha) > 0.0_dp)) return
+
+    do j0 = 1_i32, n, NC
+      j_end  = min(j0 + NC - 1_i32, n)
+      j_lim4 = j0 + ((j_end - j0 + 1_i32) / 4_i32) * 4_i32 - 1_i32
+      do l0 = 1_i32, k, KC
+        l_end = min(l0 + KC - 1_i32, k)
+        do i0 = 1_i32, m, MC
+          i_end  = min(i0 + MC - 1_i32, m)
+          i_lim4 = i0 + ((i_end - i0 + 1_i32) / 4_i32) * 4_i32 - 1_i32
+
+          do j = j0, j_lim4, 4_i32
+            do i = i0, i_lim4, 4_i32
+              c00 = 0.0_dp; c10 = 0.0_dp; c20 = 0.0_dp; c30 = 0.0_dp
+              c01 = 0.0_dp; c11 = 0.0_dp; c21 = 0.0_dp; c31 = 0.0_dp
+              c02 = 0.0_dp; c12 = 0.0_dp; c22 = 0.0_dp; c32 = 0.0_dp
+              c03 = 0.0_dp; c13 = 0.0_dp; c23 = 0.0_dp; c33 = 0.0_dp
+              do l = l0, l_end
+                a0  = A(l, i)
+                a1  = A(l, i + 1_i32)
+                a2  = A(l, i + 2_i32)
+                a3  = A(l, i + 3_i32)
+                b0  = B(l, j)
+                b1  = B(l, j + 1_i32)
+                b2  = B(l, j + 2_i32)
+                b3  = B(l, j + 3_i32)
+                c00 = c00 + a0 * b0; c10 = c10 + a1 * b0; c20 = c20 + a2 * b0; c30 = c30 + a3 * b0
+                c01 = c01 + a0 * b1; c11 = c11 + a1 * b1; c21 = c21 + a2 * b1; c31 = c31 + a3 * b1
+                c02 = c02 + a0 * b2; c12 = c12 + a1 * b2; c22 = c22 + a2 * b2; c32 = c32 + a3 * b2
+                c03 = c03 + a0 * b3; c13 = c13 + a1 * b3; c23 = c23 + a2 * b3; c33 = c33 + a3 * b3
+              end do
+              C(i,         j)         = C(i,         j)         + alpha * c00
+              C(i + 1_i32, j)         = C(i + 1_i32, j)         + alpha * c10
+              C(i + 2_i32, j)         = C(i + 2_i32, j)         + alpha * c20
+              C(i + 3_i32, j)         = C(i + 3_i32, j)         + alpha * c30
+              C(i,         j + 1_i32) = C(i,         j + 1_i32) + alpha * c01
+              C(i + 1_i32, j + 1_i32) = C(i + 1_i32, j + 1_i32) + alpha * c11
+              C(i + 2_i32, j + 1_i32) = C(i + 2_i32, j + 1_i32) + alpha * c21
+              C(i + 3_i32, j + 1_i32) = C(i + 3_i32, j + 1_i32) + alpha * c31
+              C(i,         j + 2_i32) = C(i,         j + 2_i32) + alpha * c02
+              C(i + 1_i32, j + 2_i32) = C(i + 1_i32, j + 2_i32) + alpha * c12
+              C(i + 2_i32, j + 2_i32) = C(i + 2_i32, j + 2_i32) + alpha * c22
+              C(i + 3_i32, j + 2_i32) = C(i + 3_i32, j + 2_i32) + alpha * c32
+              C(i,         j + 3_i32) = C(i,         j + 3_i32) + alpha * c03
+              C(i + 1_i32, j + 3_i32) = C(i + 1_i32, j + 3_i32) + alpha * c13
+              C(i + 2_i32, j + 3_i32) = C(i + 2_i32, j + 3_i32) + alpha * c23
+              C(i + 3_i32, j + 3_i32) = C(i + 3_i32, j + 3_i32) + alpha * c33
+            end do
+
+            do i = i_lim4 + 1_i32, i_end
+              c00 = 0.0_dp; c01 = 0.0_dp; c02 = 0.0_dp; c03 = 0.0_dp
+              do l = l0, l_end
+                a0  = A(l, i)
+                c00 = c00 + a0 * B(l, j)
+                c01 = c01 + a0 * B(l, j + 1_i32)
+                c02 = c02 + a0 * B(l, j + 2_i32)
+                c03 = c03 + a0 * B(l, j + 3_i32)
+              end do
+              C(i, j)         = C(i, j)         + alpha * c00
+              C(i, j + 1_i32) = C(i, j + 1_i32) + alpha * c01
+              C(i, j + 2_i32) = C(i, j + 2_i32) + alpha * c02
+              C(i, j + 3_i32) = C(i, j + 3_i32) + alpha * c03
+            end do
+          end do
+
+          do j = j_lim4 + 1_i32, j_end
+            do i = i0, i_lim4, 4_i32
+              c00 = 0.0_dp; c10 = 0.0_dp; c20 = 0.0_dp; c30 = 0.0_dp
+              do l = l0, l_end
+                b0  = B(l, j)
+                c00 = c00 + A(l, i)         * b0
+                c10 = c10 + A(l, i + 1_i32) * b0
+                c20 = c20 + A(l, i + 2_i32) * b0
+                c30 = c30 + A(l, i + 3_i32) * b0
+              end do
+              C(i,         j) = C(i,         j) + alpha * c00
+              C(i + 1_i32, j) = C(i + 1_i32, j) + alpha * c10
+              C(i + 2_i32, j) = C(i + 2_i32, j) + alpha * c20
+              C(i + 3_i32, j) = C(i + 3_i32, j) + alpha * c30
+            end do
+
+            do i = i_lim4 + 1_i32, i_end
+              c00 = 0.0_dp
+              do l = l0, l_end
+                c00 = c00 + A(l, i) * B(l, j)
+              end do
+              C(i, j) = C(i, j) + alpha * c00
+            end do
+          end do
         end do
-        if (beta_zero) then
-          C(i, j) = alpha * acc
-        else
-          C(i, j) = alpha * acc + beta * C(i, j)
-        end if
       end do
     end do
   end subroutine fc_gemm_tn
 
   !---------------------------------------------------------------------------
   ! C(1:m, 1:n) := alpha * A(1:m, 1:k) * B(1:n, 1:k)^T + beta * C(1:m, 1:n)
-  ! Cache-friendly j-l-i column-major order so inner i = 1..m is unit-stride.
+  ! L1/L2 cache-tiled (MC=128, NC=64, KC=128) with 1x4 column-unrolled SIMD
+  ! FMA register micro-kernel and unit-stride i inner loop (0 stack arrays).
   !---------------------------------------------------------------------------
   pure subroutine fc_gemm_nt(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
     integer(i32), intent(in) :: m, n, k, lda, ldb, ldc
@@ -149,13 +256,14 @@ contains
     real(dp), intent(in)     :: A(lda, *), B(ldb, *)
     real(dp), intent(inout)  :: C(ldc, *)
 
-    integer(i32) :: i, j, l
-    real(dp)     :: b_jl
+    integer(i32), parameter :: MC = 128_i32, NC = 64_i32, KC = 128_i32
+    integer(i32) :: i, j, l, i0, j0, l0, i_end, j_end, l_end, j_lim4
+    real(dp)     :: b0, b1, b2, b3, a_il
 
     if (m <= 0_i32 .or. n <= 0_i32) return
 
 #ifdef FORTCHUCK_USE_BLAS
-    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 32768_i64) then
+    if (int(m, i64) * int(n, i64) * int(max(k, 0_i32), i64) > 8192_i64) then
       call dgemm('N', 'T', m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
       return
     end if
@@ -177,14 +285,41 @@ contains
 
     if (k <= 0_i32 .or. .not. (abs(alpha) > 0.0_dp)) return
 
-    do j = 1_i32, n
-      do l = 1_i32, k
-        b_jl = alpha * B(j, l)
-        if (abs(b_jl) > 0.0_dp) then
-          do i = 1_i32, m
-            C(i, j) = C(i, j) + A(i, l) * b_jl
+    do j0 = 1_i32, n, NC
+      j_end  = min(j0 + NC - 1_i32, n)
+      j_lim4 = j0 + ((j_end - j0 + 1_i32) / 4_i32) * 4_i32 - 1_i32
+      do l0 = 1_i32, k, KC
+        l_end = min(l0 + KC - 1_i32, k)
+        do i0 = 1_i32, m, MC
+          i_end = min(i0 + MC - 1_i32, m)
+
+          do j = j0, j_lim4, 4_i32
+            do l = l0, l_end
+              b0 = alpha * B(j,         l)
+              b1 = alpha * B(j + 1_i32, l)
+              b2 = alpha * B(j + 2_i32, l)
+              b3 = alpha * B(j + 3_i32, l)
+              do i = i0, i_end
+                a_il            = A(i, l)
+                C(i, j)         = C(i, j)         + a_il * b0
+                C(i, j + 1_i32) = C(i, j + 1_i32) + a_il * b1
+                C(i, j + 2_i32) = C(i, j + 2_i32) + a_il * b2
+                C(i, j + 3_i32) = C(i, j + 3_i32) + a_il * b3
+              end do
+            end do
           end do
-        end if
+
+          do j = j_lim4 + 1_i32, j_end
+            do l = l0, l_end
+              b0 = alpha * B(j, l)
+              if (abs(b0) > 0.0_dp) then
+                do i = i0, i_end
+                  C(i, j) = C(i, j) + A(i, l) * b0
+                end do
+              end if
+            end do
+          end do
+        end do
       end do
     end do
   end subroutine fc_gemm_nt
@@ -403,6 +538,8 @@ contains
 
   !---------------------------------------------------------------------------
   ! Solve A * X = B in-place on B(n, nrhs) given P * A = L * U.
+  ! Hoists diagonal reciprocals inv_ukk = 1 / LU(k,k) outside RHS loops and
+  ! processes RHS columns in JB = 4 register panels (0 stack arrays).
   !---------------------------------------------------------------------------
   pure subroutine fc_lu_solve(n, nrhs, LU, ipiv, B)
     integer(i32), intent(in) :: n, nrhs
@@ -410,15 +547,32 @@ contains
     integer(i32), intent(in) :: ipiv(n)
     real(dp), intent(inout)  :: B(n, nrhs)
 
-    integer(i32) :: i, j, k, piv
-    real(dp)     :: tmp, b_kj
+    integer(i32) :: i, j, k, piv, nrhs_lim4
+    real(dp)     :: tmp, inv_ukk, l_ik, u_ik, b0, b1, b2, b3
 
     if (n <= 0_i32 .or. nrhs <= 0_i32) return
 
+    nrhs_lim4 = (nrhs / 4_i32) * 4_i32
+
+    ! 1. Apply row permutations P * B
     do k = 1_i32, n
       piv = ipiv(k)
       if (piv /= k) then
-        do j = 1_i32, nrhs
+        do j = 1_i32, nrhs_lim4, 4_i32
+          tmp             = B(k,   j)
+          B(k,   j)       = B(piv, j)
+          B(piv, j)       = tmp
+          tmp             = B(k,   j + 1_i32)
+          B(k,   j + 1_i32) = B(piv, j + 1_i32)
+          B(piv, j + 1_i32) = tmp
+          tmp             = B(k,   j + 2_i32)
+          B(k,   j + 2_i32) = B(piv, j + 2_i32)
+          B(piv, j + 2_i32) = tmp
+          tmp             = B(k,   j + 3_i32)
+          B(k,   j + 3_i32) = B(piv, j + 3_i32)
+          B(piv, j + 3_i32) = tmp
+        end do
+        do j = nrhs_lim4 + 1_i32, nrhs
           tmp       = B(k, j)
           B(k, j)   = B(piv, j)
           B(piv, j) = tmp
@@ -426,22 +580,61 @@ contains
       end if
     end do
 
-    do j = 1_i32, nrhs
+    ! 2. Forward substitution L * Y = P * B in JB = 4 RHS panels + scalar tail
+    do j = 1_i32, nrhs_lim4, 4_i32
       do k = 1_i32, n - 1_i32
-        b_kj = B(k, j)
-        if (abs(b_kj) > 0.0_dp) then
+        b0 = B(k, j)
+        b1 = B(k, j + 1_i32)
+        b2 = B(k, j + 2_i32)
+        b3 = B(k, j + 3_i32)
+        do i = k + 1_i32, n
+          l_ik            = LU(i, k)
+          B(i, j)         = B(i, j)         - l_ik * b0
+          B(i, j + 1_i32) = B(i, j + 1_i32) - l_ik * b1
+          B(i, j + 2_i32) = B(i, j + 2_i32) - l_ik * b2
+          B(i, j + 3_i32) = B(i, j + 3_i32) - l_ik * b3
+        end do
+      end do
+    end do
+
+    do j = nrhs_lim4 + 1_i32, nrhs
+      do k = 1_i32, n - 1_i32
+        b0 = B(k, j)
+        if (abs(b0) > 0.0_dp) then
           do i = k + 1_i32, n
-            B(i, j) = B(i, j) - LU(i, k) * b_kj
+            B(i, j) = B(i, j) - LU(i, k) * b0
           end do
         end if
       end do
+    end do
 
-      do k = n, 1_i32, -1_i32
-        B(k, j) = B(k, j) / LU(k, k)
-        b_kj    = B(k, j)
-        if (abs(b_kj) > 0.0_dp) then
+    ! 3. Back substitution U * X = Y with hoisted inv_ukk + JB = 4 RHS panels
+    do k = n, 1_i32, -1_i32
+      inv_ukk = 1.0_dp / LU(k, k)
+      do j = 1_i32, nrhs_lim4, 4_i32
+        b0              = B(k, j)         * inv_ukk
+        b1              = B(k, j + 1_i32) * inv_ukk
+        b2              = B(k, j + 2_i32) * inv_ukk
+        b3              = B(k, j + 3_i32) * inv_ukk
+        B(k, j)         = b0
+        B(k, j + 1_i32) = b1
+        B(k, j + 2_i32) = b2
+        B(k, j + 3_i32) = b3
+        do i = 1_i32, k - 1_i32
+          u_ik            = LU(i, k)
+          B(i, j)         = B(i, j)         - u_ik * b0
+          B(i, j + 1_i32) = B(i, j + 1_i32) - u_ik * b1
+          B(i, j + 2_i32) = B(i, j + 2_i32) - u_ik * b2
+          B(i, j + 3_i32) = B(i, j + 3_i32) - u_ik * b3
+        end do
+      end do
+
+      do j = nrhs_lim4 + 1_i32, nrhs
+        b0      = B(k, j) * inv_ukk
+        B(k, j) = b0
+        if (abs(b0) > 0.0_dp) then
           do i = 1_i32, k - 1_i32
-            B(i, j) = B(i, j) - LU(i, k) * b_kj
+            B(i, j) = B(i, j) - LU(i, k) * b0
           end do
         end if
       end do
@@ -450,7 +643,8 @@ contains
 
   !---------------------------------------------------------------------------
   ! Solve A^T * X = B in-place on B(n, nrhs) given P * A = L * U
-  ! (A^T = U^T * L^T * P).
+  ! (A^T = U^T * L^T * P), using hoisted inv_uii = 1 / LU(i,i) and JB = 4
+  ! RHS register panels over unit-stride k inner loops (0 stack arrays).
   !---------------------------------------------------------------------------
   pure subroutine fc_lu_solve_trans(n, nrhs, LU, ipiv, B)
     integer(i32), intent(in) :: n, nrhs
@@ -458,36 +652,93 @@ contains
     integer(i32), intent(in) :: ipiv(n)
     real(dp), intent(inout)  :: B(n, nrhs)
 
-    integer(i32) :: i, j, k, piv
-    real(dp)     :: acc, tmp
+    integer(i32) :: i, j, k, piv, nrhs_lim4
+    real(dp)     :: tmp, inv_uii, u_ki, l_ki, acc0, acc1, acc2, acc3
 
     if (n <= 0_i32 .or. nrhs <= 0_i32) return
 
-    do j = 1_i32, nrhs
-      ! Solve U^T * Y = B
-      do i = 1_i32, n
-        acc = B(i, j)
+    nrhs_lim4 = (nrhs / 4_i32) * 4_i32
+
+    ! 1. Solve U^T * Y = B with hoisted inv_uii = 1 / LU(i,i) across all RHS
+    do i = 1_i32, n
+      inv_uii = 1.0_dp / LU(i, i)
+      do j = 1_i32, nrhs_lim4, 4_i32
+        acc0 = B(i, j)
+        acc1 = B(i, j + 1_i32)
+        acc2 = B(i, j + 2_i32)
+        acc3 = B(i, j + 3_i32)
         do k = 1_i32, i - 1_i32
-          acc = acc - LU(k, i) * B(k, j)
+          u_ki = LU(k, i)
+          acc0 = acc0 - u_ki * B(k, j)
+          acc1 = acc1 - u_ki * B(k, j + 1_i32)
+          acc2 = acc2 - u_ki * B(k, j + 2_i32)
+          acc3 = acc3 - u_ki * B(k, j + 3_i32)
         end do
-        B(i, j) = acc / LU(i, i)
+        B(i, j)         = acc0 * inv_uii
+        B(i, j + 1_i32) = acc1 * inv_uii
+        B(i, j + 2_i32) = acc2 * inv_uii
+        B(i, j + 3_i32) = acc3 * inv_uii
       end do
 
-      ! Solve L^T * Z = Y
-      do i = n - 1_i32, 1_i32, -1_i32
-        acc = B(i, j)
-        do k = i + 1_i32, n
-          acc = acc - LU(k, i) * B(k, j)
+      do j = nrhs_lim4 + 1_i32, nrhs
+        acc0 = B(i, j)
+        do k = 1_i32, i - 1_i32
+          acc0 = acc0 - LU(k, i) * B(k, j)
         end do
-        B(i, j) = acc
+        B(i, j) = acc0 * inv_uii
       end do
     end do
 
-    ! Apply P^T: reverse swap sequence k = n .. 1
+    ! 2. Solve L^T * Z = Y in JB = 4 RHS panels + scalar tail
+    do j = 1_i32, nrhs_lim4, 4_i32
+      do i = n - 1_i32, 1_i32, -1_i32
+        acc0 = B(i, j)
+        acc1 = B(i, j + 1_i32)
+        acc2 = B(i, j + 2_i32)
+        acc3 = B(i, j + 3_i32)
+        do k = i + 1_i32, n
+          l_ki = LU(k, i)
+          acc0 = acc0 - l_ki * B(k, j)
+          acc1 = acc1 - l_ki * B(k, j + 1_i32)
+          acc2 = acc2 - l_ki * B(k, j + 2_i32)
+          acc3 = acc3 - l_ki * B(k, j + 3_i32)
+        end do
+        B(i, j)         = acc0
+        B(i, j + 1_i32) = acc1
+        B(i, j + 2_i32) = acc2
+        B(i, j + 3_i32) = acc3
+      end do
+    end do
+
+    do j = nrhs_lim4 + 1_i32, nrhs
+      do i = n - 1_i32, 1_i32, -1_i32
+        acc0 = B(i, j)
+        do k = i + 1_i32, n
+          acc0 = acc0 - LU(k, i) * B(k, j)
+        end do
+        B(i, j) = acc0
+      end do
+    end do
+
+    ! 3. Apply P^T: reverse swap sequence k = n .. 1
     do k = n, 1_i32, -1_i32
       piv = ipiv(k)
       if (piv /= k) then
-        do j = 1_i32, nrhs
+        do j = 1_i32, nrhs_lim4, 4_i32
+          tmp               = B(k,   j)
+          B(k,   j)         = B(piv, j)
+          B(piv, j)         = tmp
+          tmp               = B(k,   j + 1_i32)
+          B(k,   j + 1_i32) = B(piv, j + 1_i32)
+          B(piv, j + 1_i32) = tmp
+          tmp               = B(k,   j + 2_i32)
+          B(k,   j + 2_i32) = B(piv, j + 2_i32)
+          B(piv, j + 2_i32) = tmp
+          tmp               = B(k,   j + 3_i32)
+          B(k,   j + 3_i32) = B(piv, j + 3_i32)
+          B(piv, j + 3_i32) = tmp
+        end do
+        do j = nrhs_lim4 + 1_i32, nrhs
           tmp       = B(k, j)
           B(k, j)   = B(piv, j)
           B(piv, j) = tmp

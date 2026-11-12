@@ -1,8 +1,8 @@
 """Zero-copy Python solver interface and reusable workspace for `fortchuck`.
 
 Provides `minimize_box_stiefel()`, `FortchuckWorkspace`, `project_stiefel()`,
-`kkt_residual()`, `workspace_query()`, and `default_options()` backed by the
-stateless Modern Fortran 2018 C-ABI engine.
+`project_linear_box()`, `kkt_residual()`, `workspace_query()`, and
+`default_options()` backed by the stateless Modern Fortran 2018 C-ABI engine.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Callable, Mapping, Sequence
 import numpy as np
+from numpy.typing import ArrayLike
 
 from fortchuck._native import (
     FC_CONVERGED_FTOL,
@@ -287,17 +288,125 @@ def project_stiefel(
     return out
 
 
+def _parse_linear_constraint(
+    d: int,
+    linear_constraint: Any,
+) -> tuple[np.ndarray, float]:
+    if (
+        not isinstance(linear_constraint, Sequence)
+        or isinstance(linear_constraint, (str, bytes))
+        or len(linear_constraint) != 2
+    ):
+        raise ValueError("linear_constraint must be a (a, b) 2-tuple")
+    if d < 1:
+        raise ValueError(f"linear_constraint requires d >= 1, got d={d}")
+
+    a_raw, b_raw = linear_constraint
+    a_chk = np.asarray(a_raw, dtype=np.float64)
+    if a_chk.ndim != 1 or a_chk.size != d:
+        raise ValueError(
+            f"linear_constraint `a` must be a 1D float64 array of length d={d}, got shape {a_chk.shape}"
+        )
+    a_arr = np.ascontiguousarray(a_chk, dtype=np.float64)
+
+    if isinstance(b_raw, (bool, str, bytes)) or np.ndim(b_raw) != 0:
+        raise TypeError(
+            f"linear_constraint `b` must be a real scalar, got {type(b_raw).__name__}"
+        )
+    b_val = float(b_raw)
+    return a_arr, b_val
+
+
+def project_linear_box(
+    z: ArrayLike,
+    lower: ArrayLike,
+    upper: ArrayLike,
+    a: ArrayLike,
+    b: float,
+    *,
+    copy: bool = True,
+) -> tuple[np.ndarray, float]:
+    """Project `z` onto `{w in [lower, upper]^d : a^T w = b}` via `fortchuck_project_linear_box`.
+
+    Returns `(z_proj, nu)` where `nu` is the KKT equality multiplier satisfying
+    `z_proj = clip(z - nu * a, lower, upper)`. Raises `ValueError` on any negative
+    C-ABI status code (including `FC_ERR_INFEASIBLE_LIN = -10`).
+    """
+    lib = load_native_library()
+    z_raw = np.asarray(z, dtype=np.float64)
+    if z_raw.ndim != 1:
+        raise ValueError(f"z must be a 1D array, got shape {z_raw.shape}")
+    d = int(z_raw.size)
+    if d < 1:
+        name = STATUS_NAMES.get(-1, "FC_ERR_INVALID_DIM")
+        raise ValueError(f"fortchuck_project_linear_box failed with status -1 ({name})")
+
+    if (
+        not copy
+        and isinstance(z, np.ndarray)
+        and z.dtype == np.float64
+        and z.ndim == 1
+        and (z.flags.c_contiguous or z.flags.f_contiguous)
+        and z.flags.writeable
+    ):
+        out = z
+    else:
+        out = np.array(z_raw, dtype=np.float64, copy=True)
+
+    l_chk = np.asarray(lower, dtype=np.float64)
+    u_chk = np.asarray(upper, dtype=np.float64)
+    a_chk = np.asarray(a, dtype=np.float64)
+    if l_chk.ndim != 1 or l_chk.size != d:
+        raise ValueError(f"lower must be a 1D array of length d={d}, got shape {l_chk.shape}")
+    if u_chk.ndim != 1 or u_chk.size != d:
+        raise ValueError(f"upper must be a 1D array of length d={d}, got shape {u_chk.shape}")
+    if a_chk.ndim != 1 or a_chk.size != d:
+        raise ValueError(f"a must be a 1D array of length d={d}, got shape {a_chk.shape}")
+
+    if isinstance(b, (bool, str, bytes)) or np.ndim(b) != 0:
+        raise TypeError(f"b must be a real scalar, got {type(b).__name__}")
+    b_val = float(b)
+
+    l_arr = np.ascontiguousarray(l_chk, dtype=np.float64)
+    u_arr = np.ascontiguousarray(u_chk, dtype=np.float64)
+    a_arr = np.ascontiguousarray(a_chk, dtype=np.float64)
+
+    nu_c = ctypes.c_double(0.0)
+    st = int(
+        lib.fortchuck_project_linear_box(
+            d,
+            l_arr.ctypes.data_as(_C_F64_P),
+            u_arr.ctypes.data_as(_C_F64_P),
+            a_arr.ctypes.data_as(_C_F64_P),
+            b_val,
+            out.ctypes.data_as(_C_F64_P),
+            ctypes.byref(nu_c),
+        )
+    )
+    if st != 0:
+        name = STATUS_NAMES.get(st, str(st))
+        raise ValueError(f"fortchuck_project_linear_box failed with status {st} ({name})")
+    return out, float(nu_c.value)
+
+
 def kkt_residual(
     z: np.ndarray | Sequence[float] | None = None,
     bounds: Any = None,
     X_list: np.ndarray | Sequence[np.ndarray] | None = None,
     gz: np.ndarray | Sequence[float] | None = None,
     GX_list: np.ndarray | Sequence[np.ndarray] | None = None,
+    linear_constraint: tuple[ArrayLike, float] | None = None,
     *,
     metric: int = FC_METRIC_CANONICAL,
     work: np.ndarray | None = None,
-) -> tuple[float, float]:
-    """Compute exact `(kkt_residual, orth_error)` via `fortchuck_kkt_residual`."""
+) -> tuple[float, float] | tuple[float, float, float]:
+    """Compute exact KKT optimality and manifold/linear feasibility residuals.
+
+    - When `linear_constraint is None` (default): calls `fortchuck_kkt_residual`
+      and returns `(kkt_residual, orth_error)`.
+    - When `linear_constraint=(a, b)` is supplied: calls `fortchuck_kkt_residual_constrained`
+      and returns `(kkt_residual, lin_error, orth_error)`.
+    """
     lib = load_native_library()
 
     if z is None:
@@ -310,6 +419,13 @@ def kkt_residual(
     R = len(xs_raw)
     if d == 0 and R == 0:
         raise ValueError("At least one of z (d > 0) or X_list (R > 0) must be provided")
+
+    if linear_constraint is not None:
+        a_arr, b_val = _parse_linear_constraint(d, linear_constraint)
+        a_ptr = a_arr.ctypes.data_as(_C_F64_P)
+    else:
+        a_ptr = None
+        b_val = 0.0
 
     if d > 0:
         if gz is None:
@@ -362,6 +478,72 @@ def kkt_residual(
     else:
         n_ptr = p_ptr = None
         X_ptr = GX_ptr = None
+
+    if linear_constraint is not None:
+        if work is None:
+            q_buf = np.empty(1, dtype=np.float64)
+            st_q = int(
+                lib.fortchuck_kkt_residual_constrained(
+                    d,
+                    R,
+                    n_ptr,
+                    p_ptr,
+                    None,
+                    None,
+                    None,
+                    None,
+                    b_val,
+                    None,
+                    None,
+                    None,
+                    int(metric),
+                    q_buf.ctypes.data_as(_C_F64_P),
+                    -1,
+                    None,
+                    None,
+                    None,
+                )
+            )
+            if st_q != FC_SUCCESS_QUERY:
+                name = STATUS_NAMES.get(st_q, str(st_q))
+                raise ValueError(
+                    f"fortchuck_kkt_residual_constrained query failed with status {st_q} ({name})"
+                )
+            work_buf = np.empty(max(1, int(q_buf[0])), dtype=np.float64)
+        else:
+            if work.dtype != np.float64 or not (work.flags.c_contiguous or work.flags.f_contiguous):
+                raise ValueError("work must be a contiguous float64 NumPy array")
+            work_buf = work
+
+        kkt_inf = ctypes.c_double(0.0)
+        lin_err = ctypes.c_double(0.0)
+        orth_err = ctypes.c_double(0.0)
+        st = int(
+            lib.fortchuck_kkt_residual_constrained(
+                d,
+                R,
+                n_ptr,
+                p_ptr,
+                z_ptr,
+                l_ptr,
+                u_ptr,
+                a_ptr,
+                b_val,
+                X_ptr,
+                gz_ptr,
+                GX_ptr,
+                int(metric),
+                work_buf.ctypes.data_as(_C_F64_P),
+                int(work_buf.size),
+                ctypes.byref(kkt_inf),
+                ctypes.byref(lin_err),
+                ctypes.byref(orth_err),
+            )
+        )
+        if st != 0:
+            name = STATUS_NAMES.get(st, str(st))
+            raise ValueError(f"fortchuck_kkt_residual_constrained failed with status {st} ({name})")
+        return float(kkt_inf.value), float(lin_err.value), float(orth_err.value)
 
     if work is None:
         q_buf = np.empty(1, dtype=np.float64)
@@ -428,12 +610,13 @@ def minimize_box_stiefel(
     options: FCOptions | Mapping[str, Any] | None = None,
     work: np.ndarray | None = None,
     iwork: np.ndarray | None = None,
+    linear_constraint: tuple[ArrayLike, float] | None = None,
     *,
     workspace: FortchuckWorkspace | None = None,
     copy: bool = False,
     in_place_grad: bool = False,
 ) -> OptimizeResult:
-    """Minimize `f(z, X_1, ..., X_R)` over `[l, u]^d x St(n_1, p_1) x ... x St(n_R, p_R)`.
+    """Minimize `f(z, X_1, ..., X_R)` over `[l, u]^d` (or `{z in [l, u]^d : a^T z = b}`) x `St(...)`.
 
     Parameters
     ----------
@@ -459,6 +642,11 @@ def minimize_box_stiefel(
         Solver configuration (`FCOptions()` defaults used when `None`).
     work, iwork : ndarray or None
         Optional caller-allocated `float64` / `int32` scratch buffers.
+    linear_constraint : tuple `(a, b)` or None, default None
+        Optional single linear equality constraint `a^T z = b` (`d >= 1`). When
+        `None`, dispatches to `fortchuck_solve`; when `(a, b)` is supplied,
+        validates 1D `a` of length `d` and scalar `b` and dispatches directly to
+        `fortchuck_solve_constrained`.
     workspace : `FortchuckWorkspace` or None
         Optional reusable pre-allocated workspace object.
     copy : bool, default False
@@ -504,6 +692,12 @@ def minimize_box_stiefel(
                 z_buf = np.array(z_raw, dtype=np.float64, copy=True).ravel()
             d = int(z_buf.size)
             l_arr, u_arr = _parse_bounds(d, bounds)
+
+    if linear_constraint is not None:
+        a_arr, b_val = _parse_linear_constraint(d, linear_constraint)
+    else:
+        a_arr = None
+        b_val = 0.0
 
     # Prepare Stiefel factors X_1 .. X_R
     xs_in = _normalize_x_list(X0_list)
@@ -691,26 +885,50 @@ def minimize_box_stiefel(
     u_ptr = u_arr.ctypes.data_as(_C_F64_P) if d > 0 else None
     X_ptr = X_packed.ctypes.data_as(_C_F64_P) if R > 0 else None
 
-    status = int(
-        lib.fortchuck_solve(
-            d,
-            R,
-            n_ptr,
-            p_ptr,
-            z_ptr,
-            l_ptr,
-            u_ptr,
-            X_ptr,
-            _c_callback,
-            None,
-            ctypes.byref(opts_c),
-            work_buf.ctypes.data_as(_C_F64_P),
-            int(work_buf.size),
-            iwork_buf.ctypes.data_as(_C_I32_P),
-            int(iwork_buf.size),
-            ctypes.byref(res_c),
+    if a_arr is None:
+        status = int(
+            lib.fortchuck_solve(
+                d,
+                R,
+                n_ptr,
+                p_ptr,
+                z_ptr,
+                l_ptr,
+                u_ptr,
+                X_ptr,
+                _c_callback,
+                None,
+                ctypes.byref(opts_c),
+                work_buf.ctypes.data_as(_C_F64_P),
+                int(work_buf.size),
+                iwork_buf.ctypes.data_as(_C_I32_P),
+                int(iwork_buf.size),
+                ctypes.byref(res_c),
+            )
         )
-    )
+    else:
+        status = int(
+            lib.fortchuck_solve_constrained(
+                d,
+                R,
+                n_ptr,
+                p_ptr,
+                z_ptr,
+                l_ptr,
+                u_ptr,
+                a_arr.ctypes.data_as(_C_F64_P),
+                b_val,
+                X_ptr,
+                _c_callback,
+                None,
+                ctypes.byref(opts_c),
+                work_buf.ctypes.data_as(_C_F64_P),
+                int(work_buf.size),
+                iwork_buf.ctypes.data_as(_C_I32_P),
+                int(iwork_buf.size),
+                ctypes.byref(res_c),
+            )
+        )
 
     if captured_exc:
         raise captured_exc[0]

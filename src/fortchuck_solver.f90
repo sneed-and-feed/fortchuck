@@ -7,28 +7,35 @@ module fortchuck_solver
     FC_MAX_ITER_REACHED, FC_MAX_EVAL_REACHED, &
     FC_ERR_INVALID_DIM, FC_ERR_INVALID_BOUNDS, FC_ERR_INVALID_X0, &
     FC_ERR_WORK_TOO_SMALL, FC_ERR_CALLBACK_NAN, FC_ERR_CALLBACK_ABORT, &
-    FC_ERR_LS_FAILED, FC_ERR_INVALID_OPTS, &
+    FC_ERR_LS_FAILED, FC_ERR_INVALID_OPTS, FC_ERR_INFEASIBLE_LIN, &
     FC_METRIC_CANONICAL, FC_METRIC_EUCLIDEAN, &
     FC_DAMP_CAUTIOUS, FC_DAMP_POWELL, &
     fc_options_t, fc_result_t, fc_eval_fg_cb, fc_init_result
   use fortchuck_linalg, only: fc_frob_norm, fc_geqrf_pos
   use fortchuck_box, only: &
     fc_box_validate, fc_box_project, fc_box_kkt_residual, &
-    fc_box_partition, fc_box_dir_deriv0, fc_box_trial_step
+    fc_box_partition, fc_box_dir_deriv0, fc_box_trial_step, &
+    fc_box_breakpoint_cap, &
+    fc_box_lin_validate, fc_box_lin_project, fc_box_lin_kkt_residual, &
+    fc_box_lin_partition, fc_box_lin_trial_step
   use fortchuck_stiefel, only: &
     fc_stiefel_offsets, fc_stiefel_rgrad, fc_stiefel_proj_tangent, &
     fc_stiefel_inner, fc_stiefel_orth_err, &
     fc_cayley_setup, fc_cayley_retract, fc_cayley_transport_vec
   use fortchuck_lbfgs, only: &
-    fc_lbfgs_direction, fc_abb_direction, fc_lbfgs_transport_and_push
+    fc_lbfgs_direction, fc_lbfgs_direction_kkt, &
+    fc_abb_direction, fc_spg_lin_direction, fc_lbfgs_transport_and_push
   implicit none (type, external)
   private
 
   public :: fc_validate_options
   public :: fc_workspace_query
   public :: fc_solve
+  public :: fc_solve_constrained
   public :: fc_project_stiefel
+  public :: fc_project_linear_box
   public :: fc_kkt_residual
+  public :: fc_kkt_residual_constrained
 
 contains
 
@@ -106,7 +113,7 @@ contains
   end subroutine fc_validate_options
 
   !---------------------------------------------------------------------------
-  ! Internal helper computing exact padded workspace dimensions (ARCHITECTURE_SPEC 3.4).
+  ! Internal helper computing exact unified v0.2.0 workspace dimensions (SPEC 3.4).
   !---------------------------------------------------------------------------
   pure subroutine compute_workspace_dims(d, R, n_arr, p_arr, m, &
       d_pad, n_st_pad, n_tot_pad, n_skew_pad, m_pad, n_cay_pad, n_piv_pad, n_scr, &
@@ -119,7 +126,8 @@ contains
     integer(i32), intent(out) :: status
 
     integer(i32) :: r_idx, nr, pr
-    integer(i64) :: d64, m64, rp1_64, nr64, pr64, cr64, qr64, scr_r
+    integer(i64) :: d64, m64, k_max, rp1_64, nr64, pr64, cr64, qr64
+    integer(i64) :: scr_base, scr_batch, scr_r
     integer(i64) :: n_st, n_skew, n_cay, n_piv, max_scr_r, lim64
 
     d_pad      = 1_i64
@@ -140,6 +148,7 @@ contains
 
     d64       = int(d, i64)
     m64       = int(m, i64)
+    k_max     = 2_i64 * m64 + 2_i64
     rp1_64    = int(R, i64) + 1_i64
     lim64     = int(huge(0_i32) - 1_i32, i64)
     n_st      = 0_i64
@@ -156,16 +165,20 @@ contains
         return
       end if
 
-      nr64 = int(nr, i64)
-      pr64 = int(pr, i64)
+      nr64     = int(nr, i64)
+      pr64     = int(pr, i64)
+      scr_base = 2_i64 * nr64 * pr64 + 6_i64 * pr64 * pr64 + 4_i64 * pr64
+
       if (2_i64 * pr64 < nr64) then
-        cr64 = 2_i64 * nr64 * pr64 + 3_i64 * pr64 * pr64
-        qr64 = pr64
+        cr64      = 2_i64 * nr64 * pr64 + 3_i64 * pr64 * pr64
+        qr64      = pr64
+        scr_batch = (nr64 + 2_i64 * pr64) * pr64 * k_max + pr64 * pr64
       else
-        cr64 = 2_i64 * nr64 * nr64
-        qr64 = nr64
+        cr64      = 2_i64 * nr64 * nr64
+        qr64      = nr64
+        scr_batch = 2_i64 * nr64 * pr64 * k_max
       end if
-      scr_r = 2_i64 * nr64 * pr64 + 6_i64 * pr64 * pr64 + 4_i64 * pr64
+      scr_r = max(scr_base, scr_batch)
 
       n_st   = n_st   + nr64 * pr64
       n_skew = n_skew + pr64 * pr64
@@ -189,7 +202,7 @@ contains
     n_piv_pad  = max(1_i64, n_piv)
     n_scr      = max(64_i64, max_scr_r)
 
-    lwork_min = 5_i64 * d_pad + 6_i64 * n_st_pad + 3_i64 * n_tot_pad + &
+    lwork_min = 7_i64 * d_pad + 6_i64 * n_st_pad + 4_i64 * n_tot_pad + &
       n_skew_pad + 4_i64 * rp1_64 + 2_i64 * m64 * n_tot_pad + &
       2_i64 * m64 * n_skew_pad + 5_i64 * m_pad + n_cay_pad + n_scr
 
@@ -198,7 +211,7 @@ contains
   end subroutine compute_workspace_dims
 
   !---------------------------------------------------------------------------
-  ! Exact caller-owned workspace query (100% pure).
+  ! Exact unified caller-owned workspace query (100% pure).
   !---------------------------------------------------------------------------
   pure subroutine fc_workspace_query(d, R, n_arr, p_arr, m, lwork, liwork, status)
     integer(i32), intent(in)  :: d, R, m
@@ -255,6 +268,91 @@ contains
       end if
     end if
   end function safe_abs_diff
+
+  !---------------------------------------------------------------------------
+  ! Overflow-safe signed difference a - b avoiding FE_OVERFLOW near +-FC_HUGE.
+  !---------------------------------------------------------------------------
+  pure function safe_signed_diff(a, b) result(sd)
+    real(dp), intent(in) :: a, b
+    real(dp)             :: sd
+    real(dp)             :: hd
+
+    if (abs(a) <= 0.45_dp * FC_HUGE .and. abs(b) <= 0.45_dp * FC_HUGE) then
+      sd = a - b
+    else
+      hd = 0.5_dp * a - 0.5_dp * b
+      if (hd >= 0.5_dp * FC_HUGE) then
+        sd = FC_HUGE
+      else if (hd <= -0.5_dp * FC_HUGE) then
+        sd = -FC_HUGE
+      else
+        sd = a - b
+      end if
+    end if
+  end function safe_signed_diff
+
+  !---------------------------------------------------------------------------
+  ! Overflow-safe Neumaier compensated |a^T z - b| residual.
+  !---------------------------------------------------------------------------
+  pure function eval_lin_err_abs(d, a, b, z) result(lin_err)
+    integer(i32), intent(in) :: d
+    real(dp), intent(in)     :: a(*), b, z(*)
+    real(dp)                 :: lin_err
+
+    integer(i32) :: i
+    real(dp)     :: s, c, term, tmp, hs
+
+    s = 0.0_dp
+    c = 0.0_dp
+    do i = 1_i32, d
+      if (abs(a(i)) > 0.0_dp .and. abs(z(i)) > 0.0_dp) then
+        if (abs(a(i)) <= 1.0e153_dp .and. abs(z(i)) <= 1.0e153_dp) then
+          term = a(i) * z(i)
+        else if (abs(a(i)) >= 1.0_dp .and. abs(z(i)) >= 0.45_dp * FC_HUGE / abs(a(i))) then
+          lin_err = FC_HUGE
+          return
+        else
+          term = a(i) * z(i)
+        end if
+
+        if (abs(s) <= 0.45_dp * FC_HUGE .and. abs(term) <= 0.45_dp * FC_HUGE) then
+          tmp = s + term
+          if (abs(s) >= abs(term)) then
+            c = c + ((s - tmp) + term)
+          else
+            c = c + ((term - tmp) + s)
+          end if
+          s = tmp
+        else
+          hs = 0.5_dp * s + 0.5_dp * term
+          if (abs(hs) >= 0.5_dp * FC_HUGE) then
+            lin_err = FC_HUGE
+            return
+          end if
+          s = 2.0_dp * hs
+          c = 0.0_dp
+        end if
+      end if
+    end do
+
+    term = -b
+    if (abs(s) <= 0.45_dp * FC_HUGE .and. abs(term) <= 0.45_dp * FC_HUGE) then
+      tmp     = s + term
+      if (abs(s) >= abs(term)) then
+        c = c + ((s - tmp) + term)
+      else
+        c = c + ((term - tmp) + s)
+      end if
+      lin_err = abs(tmp + c)
+    else
+      hs = abs(0.5_dp * s - 0.5_dp * b)
+      if (hs >= 0.5_dp * FC_HUGE) then
+        lin_err = FC_HUGE
+      else
+        lin_err = 2.0_dp * hs
+      end if
+    end if
+  end function eval_lin_err_abs
 
   !---------------------------------------------------------------------------
   ! Overflow-safe Stiefel metric norm ||U||_{X, metric} from U and A_u = X^T*U.
@@ -342,6 +440,38 @@ contains
 
     status = FC_SUCCESS_QUERY
   end subroutine fc_project_stiefel
+
+  !---------------------------------------------------------------------------
+  ! Zero-workspace Euclidean projection onto {z in [l, u]^d : a^T z = b} (100% pure).
+  !---------------------------------------------------------------------------
+  pure subroutine fc_project_linear_box(d, l, u, a, b, z, nu_out, status)
+    integer(i32), intent(in)  :: d
+    real(dp), intent(in)      :: l(*), u(*), a(*)
+    real(dp), intent(in)      :: b
+    real(dp), intent(inout)   :: z(*)
+    real(dp), intent(out)     :: nu_out
+    integer(i32), intent(out) :: status
+
+    integer(i32) :: i
+
+    nu_out = 0.0_dp
+    if (d < 1_i32) then
+      status = FC_ERR_INVALID_DIM
+      return
+    end if
+
+    call fc_box_lin_validate(d, l, u, a, b, status)
+    if (status /= 0_i32) return
+
+    do i = 1_i32, d
+      if (ieee_is_nan(z(i)) .or. .not. ieee_is_finite(z(i))) then
+        status = FC_ERR_INVALID_X0
+        return
+      end if
+    end do
+
+    call fc_box_lin_project(d, l, u, a, b, z, nu_out, status)
+  end subroutine fc_project_linear_box
 
   !---------------------------------------------------------------------------
   ! Standalone coupled KKT residual & manifold orthogonality evaluator (100% pure).
@@ -463,26 +593,215 @@ contains
   end subroutine fc_kkt_residual
 
   !---------------------------------------------------------------------------
+  ! Standalone constrained KKT, linear feasibility, and orthogonality evaluator
+  ! (100% pure; minimum lwork = max(1, d + max_r(n_r*p_r + 3*p_r^2)) per SPEC 4.1).
+  !---------------------------------------------------------------------------
+  pure subroutine fc_kkt_residual_constrained( &
+      d, R, n_arr, p_arr, z, l, u, a, b, X_packed, gz, GX_packed, metric, &
+      work, lwork, kkt_inf_out, lin_err_out, orth_err_out, status)
+    integer(i32), intent(in)  :: d, R, metric
+    integer(i32), intent(in)  :: n_arr(*), p_arr(*)
+    real(dp), intent(in)      :: z(*), l(*), u(*), a(*), b, X_packed(*)
+    real(dp), intent(in)      :: gz(*), GX_packed(*)
+    real(dp), intent(inout)   :: work(*)
+    integer(i64), intent(in)  :: lwork
+    real(dp), intent(out)     :: kkt_inf_out, lin_err_out, orth_err_out
+    integer(i32), intent(out) :: status
+
+    integer(i32) :: r_idx, nr, pr, np, p2, i, x_pos, st_lin
+    integer(i64) :: lwork_min, max_req_r, req_r, tot_st, lim64
+    real(dp)     :: box_inf, ri_abs, nu_tmp, st_inf, rg_nrm, orth_r
+
+    kkt_inf_out  = 0.0_dp
+    lin_err_out  = 0.0_dp
+    orth_err_out = 0.0_dp
+
+    if (d < 1_i32 .or. R < 0_i32) then
+      status = FC_ERR_INVALID_DIM
+      return
+    end if
+    if (metric /= FC_METRIC_CANONICAL .and. metric /= FC_METRIC_EUCLIDEAN) then
+      status = FC_ERR_INVALID_OPTS
+      return
+    end if
+
+    max_req_r = 0_i64
+    tot_st    = 0_i64
+    lim64     = int(huge(0_i32) - 1_i32, i64)
+    do r_idx = 1_i32, R
+      nr = n_arr(r_idx)
+      pr = p_arr(r_idx)
+      if (nr < 1_i32 .or. pr < 1_i32 .or. pr > nr) then
+        status = FC_ERR_INVALID_DIM
+        return
+      end if
+      tot_st = tot_st + int(nr, i64) * int(pr, i64)
+      req_r  = int(nr, i64) * int(pr, i64) + 3_i64 * int(pr, i64) * int(pr, i64)
+      if (tot_st > lim64 .or. int(d, i64) + req_r > lim64) then
+        status = FC_ERR_INVALID_DIM
+        return
+      end if
+      if (req_r > max_req_r) max_req_r = req_r
+    end do
+    lwork_min = max(1_i64, int(d, i64) + max_req_r)
+
+    if (lwork == -1_i64) then
+      work(1) = real(lwork_min, dp)
+      status  = FC_SUCCESS_QUERY
+      return
+    end if
+
+    if (lwork < lwork_min) then
+      status = FC_ERR_WORK_TOO_SMALL
+      return
+    end if
+
+    call fc_box_lin_validate(d, l, u, a, b, st_lin)
+    if (st_lin /= 0_i32) then
+      status = st_lin
+      return
+    end if
+
+    do i = 1_i32, d
+      if (ieee_is_nan(z(i)) .or. .not. ieee_is_finite(z(i))) then
+        status = FC_ERR_INVALID_X0
+        return
+      end if
+      if (ieee_is_nan(gz(i)) .or. .not. ieee_is_finite(gz(i))) then
+        status = FC_ERR_CALLBACK_NAN
+        return
+      end if
+      work(i) = safe_signed_diff(z(i), gz(i))
+    end do
+
+    call fc_box_lin_project(d, l, u, a, b, work(1:d), nu_tmp, st_lin)
+    if (st_lin /= 0_i32) then
+      status = st_lin
+      return
+    end if
+
+    box_inf = 0.0_dp
+    do i = 1_i32, d
+      ri_abs = safe_abs_diff(z(i), work(i))
+      if (ri_abs > box_inf) box_inf = ri_abs
+    end do
+    lin_err_out = eval_lin_err_abs(d, a, b, z)
+
+    st_inf       = 0.0_dp
+    orth_err_out = 0.0_dp
+    x_pos        = 1_i32
+    do r_idx = 1_i32, R
+      nr = n_arr(r_idx)
+      pr = p_arr(r_idx)
+      np = nr * pr
+      p2 = pr * pr
+
+      do i = 0_i32, np - 1_i32
+        if (ieee_is_nan(X_packed(x_pos + i)) .or. .not. ieee_is_finite(X_packed(x_pos + i))) then
+          status = FC_ERR_INVALID_X0
+          return
+        end if
+        if (ieee_is_nan(GX_packed(x_pos + i)) .or. .not. ieee_is_finite(GX_packed(x_pos + i))) then
+          status = FC_ERR_CALLBACK_NAN
+          return
+        end if
+      end do
+
+      orth_r = fc_stiefel_orth_err(nr, pr, X_packed(x_pos:x_pos + np - 1_i32))
+      if (orth_r > orth_err_out) orth_err_out = orth_r
+
+      call fc_stiefel_rgrad(nr, pr, &
+        X_packed(x_pos:x_pos + np - 1_i32), GX_packed(x_pos:x_pos + np - 1_i32), metric, &
+        work(1:np), work(np + 1_i32:np + p2), work(np + p2 + 1_i32:np + 2_i32 * p2))
+      rg_nrm = stiefel_norm_from_skew(nr, pr, &
+        work(1:np), work(np + 1_i32:np + p2), metric)
+      if (rg_nrm > st_inf) st_inf = rg_nrm
+
+      x_pos = x_pos + np
+    end do
+
+    kkt_inf_out = max(box_inf, st_inf)
+    status      = FC_SUCCESS_QUERY
+  end subroutine fc_kkt_residual_constrained
+
+  !---------------------------------------------------------------------------
   ! Evaluate search direction directional derivative phi'(0+) and norms.
+  ! When has_lin_eq == .true., dz lies in T_C(z_k) with a^T dz == 0, and g_0
+  ! uses the shift-invariant reduced Lagrangian gradient ghat_z = gz + nu_k * a.
   !---------------------------------------------------------------------------
   pure subroutine eval_dir_slope_and_norms( &
-      d, R, n_arr, p_arr, metric, x_off, &
-      z, l, u, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
-      slope_box, slope_st, phi_prime0, v_st_sq, v_0, g_0, max_eta_can)
+      has_lin_eq, d, R, n_arr, p_arr, metric, x_off, &
+      z, l, u, a, nu_k, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
+      slope_box, slope_st, phi_prime0, v_box_sq, v_st_sq, v_0, g_0, max_eta_can)
+    logical, intent(in)      :: has_lin_eq
     integer(i32), intent(in) :: d, R, metric
     integer(i32), intent(in) :: n_arr(*), p_arr(*), x_off(*)
-    real(dp), intent(in)     :: z(*), l(*), u(*), gz(*), dz(*)
+    real(dp), intent(in)     :: z(*), l(*), u(*), a(*), nu_k, gz(*), dz(*)
     real(dp), intent(in)     :: X_packed(*), rgrad_X(*)
     real(dp), intent(inout)  :: eta_X(*), scratch(*)
     real(dp), intent(out)    :: slope_box, slope_st, phi_prime0
-    real(dp), intent(out)    :: v_st_sq, v_0, g_0, max_eta_can
+    real(dp), intent(out)    :: v_box_sq, v_st_sq, v_0, g_0, max_eta_can
 
-    integer(i32) :: r_idx, nr, pr, p2, x_s, x_e
-    real(dp)     :: v_box_sq, g_box_sq, g_st_sq
+    integer(i32) :: i, r_idx, nr, pr, p2, x_s, x_e
+    real(dp)     :: g_box_sq, g_st_sq, dzi, gzi, ai, nu_ai, ghat_i
     real(dp)     :: slope_r, eta_nrm_m, rg_nrm_m, eta_nrm_can
 
     if (d > 0_i32) then
-      call fc_box_dir_deriv0(d, z, l, u, gz, dz, slope_box, v_box_sq, g_box_sq)
+      if (.not. has_lin_eq) then
+        call fc_box_dir_deriv0(d, z, l, u, gz, dz, slope_box, v_box_sq, g_box_sq)
+      else
+        slope_box = 0.0_dp
+        v_box_sq  = 0.0_dp
+        g_box_sq  = 0.0_dp
+        do i = 1_i32, d
+          dzi = dz(i)
+          if (abs(dzi) > 0.0_dp .and. (l(i) < u(i))) then
+            gzi = gz(i)
+            ai  = a(i)
+            if (.not. (abs(ai) > 0.0_dp) .or. .not. (abs(nu_k) > 0.0_dp) .or. &
+                ieee_is_nan(nu_k) .or. .not. ieee_is_finite(nu_k)) then
+              ghat_i = gzi
+            else if (abs(nu_k) <= 1.0e153_dp .and. abs(ai) <= 1.0e153_dp) then
+              nu_ai  = nu_k * ai
+              ghat_i = safe_signed_diff(gzi, -nu_ai)
+            else if (abs(ai) >= 1.0_dp .and. abs(nu_k) >= 0.45_dp * FC_HUGE / abs(ai)) then
+              ghat_i = sign(FC_HUGE, nu_k) * sign(1.0_dp, ai)
+            else
+              nu_ai  = nu_k * ai
+              ghat_i = safe_signed_diff(gzi, -nu_ai)
+            end if
+
+            if (abs(ghat_i) <= 1.0e153_dp .and. abs(dzi) <= 1.0e153_dp) then
+              slope_box = slope_box + ghat_i * dzi
+            else if ((ghat_i > 0.0_dp .and. dzi > 0.0_dp) .or. &
+                     (ghat_i < 0.0_dp .and. dzi < 0.0_dp)) then
+              slope_box = FC_HUGE
+            else
+              slope_box = -FC_HUGE
+            end if
+
+            if (abs(dzi) <= 1.0e153_dp) then
+              if (0.5_dp * v_box_sq + 0.5_dp * (dzi * dzi) < 0.5_dp * FC_HUGE) then
+                v_box_sq = v_box_sq + dzi * dzi
+              else
+                v_box_sq = FC_HUGE
+              end if
+            else
+              v_box_sq = FC_HUGE
+            end if
+
+            if (abs(ghat_i) <= 1.0e153_dp) then
+              if (0.5_dp * g_box_sq + 0.5_dp * (ghat_i * ghat_i) < 0.5_dp * FC_HUGE) then
+                g_box_sq = g_box_sq + ghat_i * ghat_i
+              else
+                g_box_sq = FC_HUGE
+              end if
+            else
+              g_box_sq = FC_HUGE
+            end if
+          end if
+        end do
+      end if
     else
       slope_box = 0.0_dp
       v_box_sq  = 0.0_dp
@@ -501,16 +820,15 @@ contains
       x_s = x_off(r_idx)
       x_e = x_off(r_idx + 1_i32) - 1_i32
 
-      ! Project eta_r onto T_{X_r} St(n_r, p_r), placing A_eta = X_r^T * eta_r in scratch(1:p2)
       call fc_stiefel_proj_tangent(nr, pr, X_packed(x_s:x_e), eta_X(x_s:x_e), &
         scratch(1:p2), scratch(p2 + 1_i32:2_i32 * p2))
 
-      slope_r   = fc_stiefel_inner(nr, pr, X_packed(x_s:x_e), &
+      slope_r     = fc_stiefel_inner(nr, pr, X_packed(x_s:x_e), &
         rgrad_X(x_s:x_e), eta_X(x_s:x_e), metric)
-      eta_nrm_m = stiefel_norm_from_skew(nr, pr, eta_X(x_s:x_e), scratch(1:p2), metric)
+      eta_nrm_m   = stiefel_norm_from_skew(nr, pr, eta_X(x_s:x_e), scratch(1:p2), metric)
       eta_nrm_can = stiefel_norm_from_skew(nr, pr, eta_X(x_s:x_e), scratch(1:p2), &
         FC_METRIC_CANONICAL)
-      rg_nrm_m  = sqrt(max(0.0_dp, fc_stiefel_inner(nr, pr, X_packed(x_s:x_e), &
+      rg_nrm_m    = sqrt(max(0.0_dp, fc_stiefel_inner(nr, pr, X_packed(x_s:x_e), &
         rgrad_X(x_s:x_e), rgrad_X(x_s:x_e), metric)))
 
       slope_st = slope_st + slope_r
@@ -537,11 +855,13 @@ contains
   ! for exact 53-bit Hermite Armijo verification in the sub-ULP roundoff regime.
   !---------------------------------------------------------------------------
   pure subroutine eval_trial_slope_fast( &
-      d, R, n_arr, p_arr, x_off, cay_off, ipiv_off, &
-      z_old, z_t, gz_t, X_old, X_t, GX_t, eta_X, tau, &
+      has_lin_eq, d, R, n_arr, p_arr, x_off, cay_off, ipiv_off, &
+      a, nu_k, z_old, z_t, gz_t, X_old, X_t, GX_t, eta_X, tau, &
       cayley_persist, ipiv_all, polished_step, scratch, slope_t)
+    logical, intent(in)      :: has_lin_eq
     integer(i32), intent(in) :: d, R
     integer(i32), intent(in) :: n_arr(*), p_arr(*), x_off(*), cay_off(*), ipiv_off(*)
+    real(dp), intent(in)     :: a(*), nu_k
     real(dp), intent(in)     :: z_old(*), z_t(*), gz_t(*)
     real(dp), intent(in)     :: X_old(*), X_t(*), GX_t(*), eta_X(*), tau
     real(dp), intent(in)     :: cayley_persist(*)
@@ -551,12 +871,26 @@ contains
     real(dp), intent(out)    :: slope_t
 
     integer(i32) :: i, r_idx, nr, pr, np, p2, x_s, x_e, c_s, p_s
-    real(dp)     :: dz_i
+    real(dp)     :: dz_i, ghat_i, ai, nu_ai
 
     slope_t = 0.0_dp
     do i = 1_i32, d
-      dz_i    = z_t(i) - z_old(i)
-      slope_t = slope_t + gz_t(i) * dz_i
+      dz_i = z_t(i) - z_old(i)
+      if (.not. has_lin_eq) then
+        slope_t = slope_t + gz_t(i) * dz_i
+      else
+        ai = a(i)
+        if (.not. (abs(ai) > 0.0_dp) .or. .not. (abs(nu_k) > 0.0_dp) .or. &
+            ieee_is_nan(nu_k) .or. .not. ieee_is_finite(nu_k)) then
+          ghat_i = gz_t(i)
+        else if (abs(nu_k) <= 1.0e153_dp .and. abs(ai) <= 1.0e153_dp) then
+          nu_ai  = nu_k * ai
+          ghat_i = safe_signed_diff(gz_t(i), -nu_ai)
+        else
+          ghat_i = gz_t(i)
+        end if
+        slope_t = slope_t + ghat_i * dz_i
+      end if
     end do
 
     do r_idx = 1_i32, R
@@ -585,24 +919,125 @@ contains
   end subroutine eval_trial_slope_fast
 
   !---------------------------------------------------------------------------
+  ! Safeguarded Quadratic / Cubic Hermite + Cauchy Breakpoint Backtracking Step
+  ! (SPEC 2.6, 100% pure, dimensionless variable xi = tau / tau_prev in (0,1)).
+  !---------------------------------------------------------------------------
+  pure function hermite_backtrack_step( &
+      tau, f0, delta_tau, f_trial, &
+      have_prev, tau_prev, f_prev, &
+      has_brk, tau_brk_min) result(tau_next)
+    real(dp), intent(in) :: tau, f0, delta_tau, f_trial
+    logical, intent(in)  :: have_prev, has_brk
+    real(dp), intent(in) :: tau_prev, f_prev, tau_brk_min
+    real(dp)             :: tau_next
+
+    real(dp) :: tau_lo, tau_hi, f_ref_mag, df_cur, denom_q, frac_q, tau_quad, tau_cand
+    real(dp) :: xi, s0_t, r1, r2, denom_c, c3_t, c2_t, disc, sqrt_disc, alpha_t
+
+    tau_lo    = 0.1_dp * tau
+    tau_hi    = 0.5_dp * tau
+    f_ref_mag = max(1.0_dp, min(abs(f0), 0.2_dp * FC_HUGE))
+
+    ! Near float64 evaluation roundoff floor, use exact bisection 0.5*tau
+    ! so mantissa jitter in (f_trial - f0) cannot collapse tau by 10x per step.
+    if (abs(f_trial) <= 0.2_dp * FC_HUGE .and. abs(f0) <= 0.2_dp * FC_HUGE) then
+      if (max(abs(f_trial - f0), abs(delta_tau)) <= 1.0e-10_dp * f_ref_mag) then
+        tau_next = tau_hi
+        return
+      end if
+    end if
+
+    ! 1. Quadratic Hermite candidate on [0, tau]
+    tau_quad = tau_hi
+    if (abs(f_trial) <= 0.2_dp * FC_HUGE .and. abs(f0) <= 0.2_dp * FC_HUGE .and. &
+        abs(delta_tau) <= 0.2_dp * FC_HUGE .and. delta_tau < 0.0_dp) then
+      df_cur  = f_trial - f0
+      denom_q = 2.0_dp * (df_cur - delta_tau)
+      if (denom_q > 1.0e-30_dp .and. ieee_is_finite(denom_q)) then
+        if (denom_q >= 1.0_dp) then
+          frac_q = (-delta_tau) / denom_q
+        else if ((-delta_tau) < 0.45_dp * FC_HUGE * denom_q) then
+          frac_q = (-delta_tau) / denom_q
+        else
+          frac_q = 0.5_dp
+        end if
+        tau_quad = min(max(frac_q, 0.1_dp), 0.5_dp) * tau
+      end if
+    end if
+
+    ! 2. First rejected trial: Quadratic Hermite + Cauchy free-breakpoint probe
+    if (.not. have_prev) then
+      if (has_brk .and. tau_brk_min >= tau_lo .and. tau_brk_min < min(tau_hi, tau_quad)) then
+        tau_cand = tau_brk_min
+      else
+        tau_cand = tau_quad
+      end if
+      tau_next = min(max(tau_cand, tau_lo), tau_hi)
+      return
+    end if
+
+    ! 3. Subsequent rejected trial: Dimensionless Cubic Hermite on (0, xi, 1)
+    tau_cand = tau_quad
+    if (f_trial > f0 .and. tau_prev > tau .and. tau > 0.0_dp .and. &
+        abs(f_trial) <= 0.2_dp * FC_HUGE .and. abs(f_prev) <= 0.2_dp * FC_HUGE .and. &
+        abs(f0) <= 0.2_dp * FC_HUGE .and. delta_tau < 0.0_dp) then
+      xi = tau / tau_prev
+      if (xi >= 1.0e-6_dp .and. xi <= 0.99_dp .and. &
+          abs(delta_tau) < 0.2_dp * FC_HUGE * xi) then
+        s0_t    = delta_tau / xi
+        r1      = (f_trial - f0) - delta_tau
+        r2      = (f_prev - f0) - s0_t
+        denom_c = (xi * xi) * (xi - 1.0_dp)
+        if (abs(denom_c) > 1.0e-18_dp .and. &
+            abs(r1) <= 1.0e140_dp .and. abs(r2) <= 1.0e140_dp .and. &
+            abs(s0_t) <= 1.0e140_dp) then
+          c3_t = (r1 - (xi * xi) * r2) / denom_c
+          c2_t = (-r1 + (xi * xi * xi) * r2) / denom_c
+          if (abs(c3_t) > 1.0e-30_dp .and. abs(c3_t) <= 1.0e140_dp .and. &
+              abs(c2_t) <= 1.0e140_dp) then
+            disc = c2_t * c2_t - 3.0_dp * c3_t * s0_t
+            if (disc > 0.0_dp .and. ieee_is_finite(disc)) then
+              sqrt_disc = sqrt(disc)
+              if (c2_t > 0.0_dp) then
+                alpha_t = (-s0_t) / (c2_t + sqrt_disc)
+              else
+                alpha_t = (-c2_t + sqrt_disc) / (3.0_dp * c3_t)
+              end if
+              if (ieee_is_finite(alpha_t) .and. alpha_t > 0.0_dp) then
+                tau_cand = alpha_t * tau_prev
+              end if
+            end if
+          end if
+        end if
+      end if
+    end if
+
+    tau_next = min(max(tau_cand, tau_lo), tau_hi)
+  end function hermite_backtrack_step
+
+  !---------------------------------------------------------------------------
   ! Master Solver Core operating on pre-sliced caller-owned workspace arrays.
+  ! Supports both unconstrained box (has_lin_eq == .false.) and singly-linearly
+  ! constrained box / simplex (has_lin_eq == .true.).
   !---------------------------------------------------------------------------
   subroutine fc_solve_core( &
-      d, R, n_arr, p_arr, z, l, u, X_packed, eval_fg, udata, opts, res, &
+      has_lin_eq, d, R, n_arr, p_arr, z, l, u, a, b, X_packed, &
+      eval_fg, udata, opts, res, &
       d_pad, n_st_pad, n_tot_pad, n_skew_pad, m_pad, n_cay_pad, n_piv_pad, n_scr, &
-      z_trial, gz, gz_trial, dz, rbox, &
+      z_trial, gz, gz_trial, dz, rbox, diag_box, z_spg, &
       X_trial, GX, GX_trial, rgrad_X, rgrad_old, eta_X, &
-      q_buf, s_cur, y_cur, Aq_buf, &
+      q_buf, w_buf, s_cur, y_cur, Aq_buf, &
       gamma_blk, abb_ss, abb_sy, abb_yy, &
       s_hist, y_hist, As_hist, Ay_hist, &
       st_sy, st_ss, st_yy, rho_m, alpha_m, &
       cayley_persist, scratch, &
       mask_box, active_pair_flag, ring_order, &
       x_off, skew_off, cay_off, ipiv_off, ipiv_all)
+    logical, intent(in)              :: has_lin_eq
     integer(i32), intent(in)         :: d, R
     integer(i32), intent(in)         :: n_arr(*), p_arr(*)
     real(dp), intent(inout)          :: z(*), X_packed(*)
-    real(dp), intent(in)             :: l(*), u(*)
+    real(dp), intent(in)             :: l(*), u(*), a(*), b
     procedure(fc_eval_fg_cb)         :: eval_fg
     type(c_ptr), value, intent(in)   :: udata
     type(fc_options_t), intent(in)   :: opts
@@ -610,10 +1045,11 @@ contains
     integer(i32), intent(in)         :: d_pad, n_st_pad, n_tot_pad, n_skew_pad
     integer(i32), intent(in)         :: m_pad, n_cay_pad, n_piv_pad, n_scr
     real(dp), intent(inout)          :: z_trial(d_pad), gz(d_pad), gz_trial(d_pad)
-    real(dp), intent(inout)          :: dz(d_pad), rbox(d_pad)
+    real(dp), intent(inout)          :: dz(d_pad), rbox(d_pad), diag_box(d_pad), z_spg(d_pad)
     real(dp), intent(inout)          :: X_trial(n_st_pad), GX(n_st_pad), GX_trial(n_st_pad)
     real(dp), intent(inout)          :: rgrad_X(n_st_pad), rgrad_old(n_st_pad), eta_X(n_st_pad)
-    real(dp), intent(inout)          :: q_buf(n_tot_pad), s_cur(n_tot_pad), y_cur(n_tot_pad)
+    real(dp), intent(inout)          :: q_buf(n_tot_pad), w_buf(n_tot_pad)
+    real(dp), intent(inout)          :: s_cur(n_tot_pad), y_cur(n_tot_pad)
     real(dp), intent(inout)          :: Aq_buf(n_skew_pad)
     real(dp), intent(inout)          :: gamma_blk(R + 1_i32), abb_ss(R + 1_i32)
     real(dp), intent(inout)          :: abb_sy(R + 1_i32), abb_yy(R + 1_i32)
@@ -632,17 +1068,20 @@ contains
 
     integer(i32) :: n_st_tot, n_skew_tot, n_cayley_tot, n_ipiv_tot, st
     integer(i32) :: i, idx, r_idx, nr, pr, np, p2, x_s, x_e, sk_s, sk_e, c_s, p_s
-    integer(i32) :: info_qr, info_lu, rc, n_eval, n_active_box, p_max
+    integer(i32) :: info_qr, info_lu, rc, n_eval, n_active_box, p_max, n_free_hit
     integer(i32) :: k_iter, ls_step, attempt, m_cur, ring_head, tiny_df_streak, stag_streak
     real(dp)     :: orth_r, orth_max, f_k, f_trial, box_res, box_l2, st_res, rg_nrm
+    real(dp)     :: nu_k, delta_b, lin_err0, lin_tol0
     real(dp)     :: kkt_res, kkt_old, best_kkt, zh_eta_eff, Q_zh, C_zh, Q_next
-    real(dp)     :: slope_box, slope_st, phi_prime0, v_st_sq, v_0, g_0, max_eta_can
+    real(dp)     :: slope_box, slope_st, phi_prime0, v_box_sq, v_st_sq, v_0, g_0, max_eta_can
     real(dp)     :: tau_init, tau, chord_gz, box_step_sq, delta_tau, tot_step_sq
+    real(dp)     :: tau_brk_min, tau_brk_max, tau_prev_ls, f_prev_ls, tau_new
     real(dp)     :: drift_r, max_drift_step, f_scale, f_diff
     real(dp)     :: z_diff_inf, z_norm_inf, X_diff_max, x_diff_r, sqrt_p_max
     real(dp)     :: step_diff, x_scale, ftol_eff, xtol_eff, slope_trial, c_scale
-    logical      :: has_prev, used_qn, descent_ok, ls_accepted, lu_failed, qr_failed
-    logical      :: polished_step, is_default_ftol, is_default_xtol
+    logical      :: has_prev, used_qn, fallback_spg, descent_ok, ls_accepted
+    logical      :: lu_failed, qr_failed, polished_step, have_prev_ls, has_brk
+    logical      :: is_default_ftol, is_default_xtol
 
     ! 1. Compute packed Stiefel offsets
     call fc_stiefel_offsets(R, n_arr, p_arr, &
@@ -658,9 +1097,53 @@ contains
     gz(1)      = 0.0_dp
     X_trial(1) = 0.0_dp
     GX(1)      = 0.0_dp
+    nu_k       = 0.0_dp
+    delta_b    = 0.0_dp
 
-    ! 2. Validate bounds & project/verify initial z0
-    if (d > 0_i32) then
+    ! 2. Validate bounds (+ linear constraint if has_lin_eq) & project/verify z0
+    if (has_lin_eq) then
+      if (d < 1_i32) then
+        res%status = FC_ERR_INVALID_DIM
+        return
+      end if
+      call fc_box_lin_validate(d, l, u, a, b, st)
+      if (st /= 0_i32) then
+        res%status = st
+        return
+      end if
+
+      do i = 1_i32, d
+        if (ieee_is_nan(z(i)) .or. .not. ieee_is_finite(z(i))) then
+          res%status = FC_ERR_INVALID_X0
+          return
+        end if
+      end do
+
+      if (opts%project_initial == 1_i32) then
+        call fc_box_lin_project(d, l, u, a, b, z, nu_k, st)
+        if (st /= 0_i32) then
+          res%status = st
+          return
+        end if
+      else
+        do i = 1_i32, d
+          if (ieee_is_finite(l(i)) .and. safe_signed_diff(l(i), z(i)) > 1.0e-8_dp) then
+            res%status = FC_ERR_INVALID_X0
+            return
+          end if
+          if (ieee_is_finite(u(i)) .and. safe_signed_diff(z(i), u(i)) > 1.0e-8_dp) then
+            res%status = FC_ERR_INVALID_X0
+            return
+          end if
+        end do
+        lin_err0 = eval_lin_err_abs(d, a, b, z)
+        lin_tol0 = 1.0e-8_dp + 1.0e-8_dp * min(abs(b), 0.5_dp * FC_HUGE)
+        if (lin_err0 > lin_tol0) then
+          res%status = FC_ERR_INVALID_X0
+          return
+        end if
+      end if
+    else if (d > 0_i32) then
       call fc_box_validate(d, l, u, st)
       if (st /= 0_i32) then
         res%status = FC_ERR_INVALID_BOUNDS
@@ -755,8 +1238,16 @@ contains
       return
     end if
 
-    ! Compute initial KKT residuals and active-band partition
-    if (d > 0_i32) then
+    ! Compute initial KKT residuals and active-band / active-face partition
+    if (has_lin_eq) then
+      call fc_box_lin_kkt_residual(d, z, l, u, a, b, gz, &
+        z_spg, rbox, nu_k, box_res, box_l2, st)
+      if (st /= 0_i32) then
+        res%status = st
+        return
+      end if
+      call fc_box_lin_partition(d, z, l, u, a, gz, nu_k, mask_box, dz, delta_b, n_active_box)
+    else if (d > 0_i32) then
       call fc_box_kkt_residual(d, z, l, u, gz, rbox, box_res, box_l2)
       call fc_box_partition(d, z, l, u, gz, box_res, opts%eps_band, mask_box, n_active_box)
     else
@@ -840,46 +1331,104 @@ contains
       abb_sy(r_idx)    = 0.0_dp
       abb_yy(r_idx)    = 0.0_dp
     end do
+    do i = 1_i32, d_pad
+      diag_box(i) = 1.0_dp
+    end do
     do i = 1_i32, n_tot_pad
+      w_buf(i) = 0.0_dp
       s_cur(i) = 0.0_dp
       y_cur(i) = 0.0_dp
     end do
 
     ! 5. Main Coupled Quasi-Newton Loop
     do k_iter = 0_i32, opts%max_iter - 1_i32
-      ! 5a. Save fresh Aq_buf copy if needed for ABB fallback: note fc_stiefel_rgrad
-      ! can rapidly refresh Aq_buf on fallback, so zero permanent overhead on QN path!
+      ! 5a. Preserve untouched X_r^T * rgrad_{X,r} in GX_trial(1:n_skew_tot)
+      !     (n_skew_tot <= n_st_tot <= n_st_pad always since 1 <= p_r <= n_r).
+      do idx = 1_i32, n_skew_tot
+        GX_trial(idx) = Aq_buf(idx)
+      end do
+
+      if (has_lin_eq) then
+        call fc_box_lin_partition(d, z, l, u, a, gz, nu_k, mask_box, dz, delta_b, n_active_box)
+      end if
 
       ! 5b. Compute candidate search direction (dz, eta_X)
       if (m_cur >= 1_i32 .and. opts%memory >= 1_i32) then
-        call fc_lbfgs_direction( &
-          d, R, n_st_tot, n_skew_tot, opts%metric, &
-          opts%memory, m_cur, n_tot_pad, n_skew_pad, &
-          x_off, skew_off, &
-          z, l, u, gz, mask_box, &
-          rgrad_X, Aq_buf, &
-          gamma_blk, has_prev, s_cur, y_cur, &
-          s_hist, y_hist, As_hist, Ay_hist, &
-          st_sy, st_ss, st_yy, rho_m, alpha_m, &
-          active_pair_flag, ring_order, &
-          q_buf, dz, eta_X)
-        used_qn = .true.
+        if (.not. has_lin_eq) then
+          call fc_lbfgs_direction( &
+            d, R, n_st_tot, n_skew_tot, opts%metric, &
+            opts%memory, m_cur, n_tot_pad, n_skew_pad, &
+            x_off, skew_off, &
+            z, l, u, gz, mask_box, diag_box, &
+            rgrad_X, Aq_buf, &
+            gamma_blk, has_prev, s_cur, y_cur, &
+            s_hist, y_hist, As_hist, Ay_hist, &
+            st_sy, st_ss, st_yy, rho_m, alpha_m, &
+            active_pair_flag, ring_order, &
+            q_buf, dz, eta_X)
+          used_qn = .true.
+        else
+          call fc_lbfgs_direction_kkt( &
+            d, R, n_st_tot, n_skew_tot, opts%metric, &
+            opts%memory, m_cur, n_tot_pad, n_skew_pad, &
+            x_off, skew_off, &
+            z, l, u, a, gz, nu_k, mask_box, n_active_box, delta_b, diag_box, &
+            rgrad_X, GX_trial, Aq_buf, &
+            gamma_blk, &
+            s_hist, y_hist, As_hist, Ay_hist, &
+            st_sy, st_ss, st_yy, rho_m, alpha_m, &
+            active_pair_flag, ring_order, &
+            q_buf, w_buf, dz, eta_X, fallback_spg)
+          if (fallback_spg) then
+            m_cur           = 0_i32
+            ring_head       = 0_i32
+            res%n_fallbacks = res%n_fallbacks + 1_i32
+            used_qn         = .false.
+            call fc_spg_lin_direction( &
+              k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+              x_off, skew_off, &
+              z, l, u, a, b, gz, nu_k, &
+              rgrad_X, GX_trial, &
+              abb_ss, abb_sy, abb_yy, &
+              z_spg, dz, eta_X, st)
+            if (st /= 0_i32) then
+              res%status = st
+              return
+            end if
+          else
+            used_qn = .true.
+          end if
+        end if
       else
-        call fc_abb_direction( &
-          k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
-          x_off, skew_off, &
-          z, l, u, gz, mask_box, &
-          rgrad_X, Aq_buf, &
-          abb_ss, abb_sy, abb_yy, &
-          dz, eta_X)
+        if (.not. has_lin_eq) then
+          call fc_abb_direction( &
+            k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+            x_off, skew_off, &
+            z, l, u, gz, mask_box, &
+            rgrad_X, GX_trial, &
+            abb_ss, abb_sy, abb_yy, &
+            dz, eta_X)
+        else
+          call fc_spg_lin_direction( &
+            k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+            x_off, skew_off, &
+            z, l, u, a, b, gz, nu_k, &
+            rgrad_X, GX_trial, &
+            abb_ss, abb_sy, abb_yy, &
+            z_spg, dz, eta_X, st)
+          if (st /= 0_i32) then
+            res%status = st
+            return
+          end if
+        end if
         used_qn = .false.
       end if
 
       ! 5c. Check strict directional descent phi'(0+) <= -1e-12 * v_0 * g_0
       call eval_dir_slope_and_norms( &
-        d, R, n_arr, p_arr, opts%metric, x_off, &
-        z, l, u, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
-        slope_box, slope_st, phi_prime0, v_st_sq, v_0, g_0, max_eta_can)
+        has_lin_eq, d, R, n_arr, p_arr, opts%metric, x_off, &
+        z, l, u, a, nu_k, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
+        slope_box, slope_st, phi_prime0, v_box_sq, v_st_sq, v_0, g_0, max_eta_can)
 
       descent_ok = .false.
       if (v_0 > 0.0_dp .and. ieee_is_finite(phi_prime0) .and. phi_prime0 < 0.0_dp) then
@@ -892,39 +1441,47 @@ contains
         end if
       end if
 
+      if (has_lin_eq .and. used_qn .and. box_res > max(opts%gtol, 1.0e-3_dp * st_res)) then
+        if (sqrt(max(0.0_dp, v_box_sq)) <= 1.0e-14_dp * box_res) then
+          descent_ok = .false.
+        end if
+      end if
+
       if (.not. descent_ok .and. used_qn) then
         m_cur           = 0_i32
         ring_head       = 0_i32
         res%n_fallbacks = res%n_fallbacks + 1_i32
         used_qn         = .false.
 
-        do r_idx = 1_i32, R
-          nr   = n_arr(r_idx)
-          pr   = p_arr(r_idx)
-          p2   = pr * pr
-          x_s  = x_off(r_idx)
-          x_e  = x_off(r_idx + 1_i32) - 1_i32
-          sk_s = skew_off(r_idx)
-          sk_e = skew_off(r_idx + 1_i32) - 1_i32
-          call fc_stiefel_rgrad(nr, pr, X_packed(x_s:x_e), GX(x_s:x_e), opts%metric, &
-            rgrad_X(x_s:x_e), Aq_buf(sk_s:sk_e), scratch(1:p2))
-        end do
-
-        call fc_abb_direction( &
-          k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
-          x_off, skew_off, &
-          z, l, u, gz, mask_box, &
-          rgrad_X, Aq_buf, &
-          abb_ss, abb_sy, abb_yy, &
-          dz, eta_X)
+        if (.not. has_lin_eq) then
+          call fc_abb_direction( &
+            k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+            x_off, skew_off, &
+            z, l, u, gz, mask_box, &
+            rgrad_X, GX_trial, &
+            abb_ss, abb_sy, abb_yy, &
+            dz, eta_X)
+        else
+          call fc_spg_lin_direction( &
+            k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+            x_off, skew_off, &
+            z, l, u, a, b, gz, nu_k, &
+            rgrad_X, GX_trial, &
+            abb_ss, abb_sy, abb_yy, &
+            z_spg, dz, eta_X, st)
+          if (st /= 0_i32) then
+            res%status = st
+            return
+          end if
+        end if
 
         call eval_dir_slope_and_norms( &
-          d, R, n_arr, p_arr, opts%metric, x_off, &
-          z, l, u, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
-          slope_box, slope_st, phi_prime0, v_st_sq, v_0, g_0, max_eta_can)
+          has_lin_eq, d, R, n_arr, p_arr, opts%metric, x_off, &
+          z, l, u, a, nu_k, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
+          slope_box, slope_st, phi_prime0, v_box_sq, v_st_sq, v_0, g_0, max_eta_can)
       end if
 
-      ! 5d. Two-chance Zhang-Hager / Generalized Arc-Armijo backtracking line search
+      ! 5d. Two-chance Zhang-Hager / Arc-Armijo + Hermite/Breakpoint line search
       ls_accepted    = .false.
       polished_step  = .false.
       max_drift_step = 0.0_dp
@@ -941,14 +1498,46 @@ contains
             cayley_persist(c_s), scratch)
         end do
 
+        if (d > 0_i32 .and. ((.not. has_lin_eq) .or. used_qn)) then
+          call fc_box_breakpoint_cap(d, z, l, u, mask_box, dz, &
+            tau_brk_min, tau_brk_max, n_free_hit)
+        else
+          tau_brk_min = FC_HUGE
+          tau_brk_max = 0.0_dp
+          n_free_hit  = 0_i32
+        end if
+        has_brk = (d > 0_i32 .and. n_free_hit > 0_i32)
+
         tau_init = 1.0_dp
         if (R > 0_i32 .and. max_eta_can > opts%max_step_vel) then
           tau_init = min(tau_init, opts%max_step_vel / max_eta_can)
         end if
-        tau = tau_init
+        tau          = tau_init
+        have_prev_ls = .false.
+        tau_prev_ls  = 0.0_dp
+        f_prev_ls    = 0.0_dp
 
         ls_loop: do ls_step = 1_i32, opts%max_ls_steps
-          if (d > 0_i32) then
+          if (has_lin_eq) then
+            call fc_box_lin_trial_step(d, z, l, u, a, b, gz, dz, tau, &
+              z_trial, chord_gz, box_step_sq, st)
+            if (st /= 0_i32) then
+              tau          = 0.5_dp * tau
+              have_prev_ls = .false.
+              cycle ls_loop
+            end if
+            if (abs(nu_k) > 0.0_dp .and. ieee_is_finite(nu_k)) then
+              chord_gz = 0.0_dp
+              do i = 1_i32, d
+                if (abs(nu_k) <= 1.0e153_dp .and. abs(a(i)) <= 1.0e153_dp) then
+                  chord_gz = chord_gz + &
+                    safe_signed_diff(gz(i), -(nu_k * a(i))) * safe_signed_diff(z_trial(i), z(i))
+                else
+                  chord_gz = chord_gz + gz(i) * safe_signed_diff(z_trial(i), z(i))
+                end if
+              end do
+            end if
+          else if (d > 0_i32) then
             call fc_box_trial_step(d, z, l, u, gz, dz, tau, z_trial, chord_gz, box_step_sq)
           else
             chord_gz    = 0.0_dp
@@ -964,7 +1553,8 @@ contains
 
           if (.not. (tot_step_sq > 0.0_dp) .or. .not. (delta_tau < 0.0_dp) .or. &
               delta_tau > -1.0e-12_dp * tot_step_sq) then
-            tau = 0.5_dp * tau
+            tau          = 0.5_dp * tau
+            have_prev_ls = .false.
             cycle ls_loop
           end if
 
@@ -984,7 +1574,8 @@ contains
             end if
           end do
           if (lu_failed) then
-            tau = 0.5_dp * tau
+            tau          = 0.5_dp * tau
+            have_prev_ls = .false.
             cycle ls_loop
           end if
 
@@ -1018,7 +1609,8 @@ contains
             end if
           end do
           if (qr_failed) then
-            tau = 0.5_dp * tau
+            tau          = 0.5_dp * tau
+            have_prev_ls = .false.
             cycle ls_loop
           end if
 
@@ -1039,7 +1631,8 @@ contains
             return
           end if
           if (rc > 0_i32 .or. .not. is_trial_finite(d, n_st_tot, f_trial, gz_trial, GX_trial)) then
-            tau = 0.5_dp * tau
+            tau          = 0.5_dp * tau
+            have_prev_ls = .false.
             cycle ls_loop
           end if
 
@@ -1051,8 +1644,8 @@ contains
             if (abs(delta_tau) <= 256.0_dp * FC_EPS * c_scale .and. &
                 f_trial <= C_zh + 16.0_dp * FC_EPS * c_scale) then
               call eval_trial_slope_fast( &
-                d, R, n_arr, p_arr, x_off, cay_off, ipiv_off, &
-                z, z_trial, gz_trial, X_packed, X_trial, GX_trial, eta_X, tau, &
+                has_lin_eq, d, R, n_arr, p_arr, x_off, cay_off, ipiv_off, &
+                a, nu_k, z, z_trial, gz_trial, X_packed, X_trial, GX_trial, eta_X, tau, &
                 cayley_persist, ipiv_all, polished_step, scratch, slope_trial)
               if (0.5_dp * (delta_tau + slope_trial) <= opts%c1_armijo * delta_tau) then
                 ls_accepted = .true.
@@ -1061,10 +1654,18 @@ contains
             end if
           end if
 
-          tau = 0.5_dp * tau
+          ! Safeguarded Quadratic/Cubic Hermite + Cauchy breakpoint update
+          tau_new = hermite_backtrack_step( &
+            tau, f_k, delta_tau, f_trial, &
+            have_prev_ls, tau_prev_ls, f_prev_ls, &
+            has_brk, tau_brk_min)
+          have_prev_ls = .true.
+          tau_prev_ls  = tau
+          f_prev_ls    = f_trial
+          tau          = tau_new
         end do ls_loop
 
-        ! If QN backtracking failed, flush history and retry once with ABB steepest descent
+        ! If QN backtracking failed, flush history and retry once with ABB / SPG
         if (used_qn) then
           m_cur           = 0_i32
           ring_head       = 0_i32
@@ -1083,18 +1684,32 @@ contains
               rgrad_X(x_s:x_e), Aq_buf(sk_s:sk_e), scratch(1:p2))
           end do
 
-          call fc_abb_direction( &
-            k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
-            x_off, skew_off, &
-            z, l, u, gz, mask_box, &
-            rgrad_X, Aq_buf, &
-            abb_ss, abb_sy, abb_yy, &
-            dz, eta_X)
+          if (.not. has_lin_eq) then
+            call fc_abb_direction( &
+              k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+              x_off, skew_off, &
+              z, l, u, gz, mask_box, &
+              rgrad_X, Aq_buf, &
+              abb_ss, abb_sy, abb_yy, &
+              dz, eta_X)
+          else
+            call fc_spg_lin_direction( &
+              k_iter, has_prev, d, R, n_arr, p_arr, opts%metric, &
+              x_off, skew_off, &
+              z, l, u, a, b, gz, nu_k, &
+              rgrad_X, Aq_buf, &
+              abb_ss, abb_sy, abb_yy, &
+              z_spg, dz, eta_X, st)
+            if (st /= 0_i32) then
+              res%status = st
+              return
+            end if
+          end if
 
           call eval_dir_slope_and_norms( &
-            d, R, n_arr, p_arr, opts%metric, x_off, &
-            z, l, u, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
-            slope_box, slope_st, phi_prime0, v_st_sq, v_0, g_0, max_eta_can)
+            has_lin_eq, d, R, n_arr, p_arr, opts%metric, x_off, &
+            z, l, u, a, nu_k, gz, dz, X_packed, rgrad_X, eta_X, scratch, &
+            slope_box, slope_st, phi_prime0, v_box_sq, v_st_sq, v_0, g_0, max_eta_can)
         else
           exit attempt_loop
         end if
@@ -1143,13 +1758,22 @@ contains
       C_zh   = (zh_eta_eff * Q_zh * C_zh + f_trial) / Q_next
       Q_zh   = Q_next
 
-      ! 5f-5h. Evaluate new KKT/rgrad, transport history, update BB2, and push (s_k, y_k)
+      ! 5f-5h. Evaluate new KKT/rgrad, batch-transport history, update diag/BB2, push
       kkt_old = kkt_res
       do idx = 1_i32, n_st_tot
         rgrad_old(idx) = rgrad_X(idx)
       end do
 
-      if (d > 0_i32) then
+      if (has_lin_eq) then
+        call fc_box_lin_kkt_residual(d, z_trial, l, u, a, b, gz_trial, &
+          z_spg, rbox, nu_k, box_res, box_l2, st)
+        if (st /= 0_i32) then
+          res%status = st
+          return
+        end if
+        call fc_box_lin_partition(d, z_trial, l, u, a, gz_trial, nu_k, &
+          mask_box, dz, delta_b, n_active_box)
+      else if (d > 0_i32) then
         call fc_box_kkt_residual(d, z_trial, l, u, gz_trial, rbox, box_res, box_l2)
         call fc_box_partition(d, z_trial, l, u, gz_trial, box_res, opts%eps_band, &
           mask_box, n_active_box)
@@ -1179,14 +1803,14 @@ contains
       end do
 
       call fc_lbfgs_transport_and_push( &
-        d, R, n_arr, p_arr, n_st_tot, opts%metric, opts%damping_mode, &
+        k_iter, d, R, n_arr, p_arr, n_st_tot, opts%metric, opts%damping_mode, &
         opts%memory, m_cur, ring_head, n_tot_pad, n_skew_pad, &
         x_off, skew_off, cay_off, ipiv_off, &
         l, u, z, z_trial, gz, gz_trial, mask_box, &
         X_packed, X_trial, eta_X, tau, cayley_persist, ipiv_all, &
         rgrad_old, rgrad_X, &
         kkt_old, polished_step, max_drift_step, &
-        gamma_blk, abb_ss, abb_sy, abb_yy, &
+        gamma_blk, diag_box, abb_ss, abb_sy, abb_yy, &
         s_cur, y_cur, &
         s_hist, y_hist, As_hist, Ay_hist, &
         st_sy, st_ss, st_yy, ring_order, scratch)
@@ -1264,15 +1888,16 @@ contains
   end subroutine fc_solve_core
 
   !---------------------------------------------------------------------------
-  ! Public Native Fortran 2018 Master Solver Entry Point (0 heap allocations).
+  ! Internal unified workspace dispatcher for fc_solve & fc_solve_constrained.
   !---------------------------------------------------------------------------
-  subroutine fc_solve( &
-      d, R, n_arr, p_arr, z, l, u, X_packed, eval_fg, udata, &
+  subroutine fc_solve_entry( &
+      has_lin_eq, d, R, n_arr, p_arr, z, l, u, a, b, X_packed, eval_fg, udata, &
       opts, work, lwork, iwork, liwork, res)
+    logical, intent(in)            :: has_lin_eq
     integer(i32), intent(in)       :: d, R
     integer(i32), intent(in)       :: n_arr(*), p_arr(*)
     real(dp), intent(inout)        :: z(*), X_packed(*)
-    real(dp), intent(in)           :: l(*), u(*)
+    real(dp), intent(in)           :: l(*), u(*), a(*), b
     procedure(fc_eval_fg_cb)       :: eval_fg
     type(c_ptr), value, intent(in) :: udata
     type(fc_options_t), intent(in) :: opts
@@ -1285,9 +1910,9 @@ contains
     integer(i64) :: d_pad, n_st_pad, n_tot_pad, n_skew_pad
     integer(i64) :: m_pad, n_cay_pad, n_piv_pad, n_scr
     integer(i64) :: lwork_min, liwork_min, m64, rp1_64
-    integer(i64) :: w_z_trial, w_gz, w_gz_trial, w_dz, w_rbox
+    integer(i64) :: w_z_trial, w_gz, w_gz_trial, w_dz, w_rbox, w_diag_box, w_z_spg
     integer(i64) :: w_X_trial, w_GX, w_GX_trial, w_rgrad_X, w_rgrad_old, w_eta_X
-    integer(i64) :: w_q_buf, w_s_cur, w_y_cur, w_Aq_buf
+    integer(i64) :: w_q_buf, w_w_buf, w_s_cur, w_y_cur, w_Aq_buf
     integer(i64) :: w_gamma_blk, w_abb_ss, w_abb_sy, w_abb_yy
     integer(i64) :: w_s_hist, w_y_hist, w_As_hist, w_Ay_hist
     integer(i64) :: w_st_sy, w_st_ss, w_st_yy, w_rho_m, w_alpha_m
@@ -1297,6 +1922,11 @@ contains
     integer(i32) :: st
 
     call fc_init_result(res)
+
+    if (has_lin_eq .and. d < 1_i32) then
+      res%status = FC_ERR_INVALID_DIM
+      return
+    end if
 
     call compute_workspace_dims(d, R, n_arr, p_arr, opts%memory, &
       d_pad, n_st_pad, n_tot_pad, n_skew_pad, m_pad, n_cay_pad, n_piv_pad, n_scr, &
@@ -1327,7 +1957,7 @@ contains
       return
     end if
 
-    ! Exact 10-segment work(1:lwork) and 4-segment iwork(1:liwork) layout (ARCHITECTURE_SPEC 3.4)
+    ! Exact 10-segment work(1:lwork) and 4-segment iwork(1:liwork) layout (SPEC 3.4)
     m64    = int(opts%memory, i64)
     rp1_64 = int(R, i64) + 1_i64
 
@@ -1336,8 +1966,10 @@ contains
     w_gz_trial  = w_gz        + d_pad
     w_dz        = w_gz_trial  + d_pad
     w_rbox      = w_dz        + d_pad
+    w_diag_box  = w_rbox      + d_pad
+    w_z_spg     = w_diag_box  + d_pad
 
-    w_X_trial   = w_rbox      + d_pad
+    w_X_trial   = w_z_spg     + d_pad
     w_GX        = w_X_trial   + n_st_pad
     w_GX_trial  = w_GX        + n_st_pad
     w_rgrad_X   = w_GX_trial  + n_st_pad
@@ -1345,7 +1977,8 @@ contains
     w_eta_X     = w_rgrad_old + n_st_pad
 
     w_q_buf     = w_eta_X     + n_st_pad
-    w_s_cur     = w_q_buf     + n_tot_pad
+    w_w_buf     = w_q_buf     + n_tot_pad
+    w_s_cur     = w_w_buf     + n_tot_pad
     w_y_cur     = w_s_cur     + n_tot_pad
 
     w_Aq_buf    = w_y_cur     + n_tot_pad
@@ -1380,21 +2013,24 @@ contains
     iw_ipiv_all    = iw_ipiv_off    + rp1_64
 
     call fc_solve_core( &
-      d, R, n_arr, p_arr, z, l, u, X_packed, eval_fg, udata, opts, res, &
+      has_lin_eq, d, R, n_arr, p_arr, z, l, u, a, b, X_packed, eval_fg, udata, opts, res, &
       int(d_pad, i32), int(n_st_pad, i32), int(n_tot_pad, i32), int(n_skew_pad, i32), &
       int(m_pad, i32), int(n_cay_pad, i32), int(n_piv_pad, i32), int(n_scr, i32), &
       work(w_z_trial:w_gz - 1_i64), &
       work(w_gz:w_gz_trial - 1_i64), &
       work(w_gz_trial:w_dz - 1_i64), &
       work(w_dz:w_rbox - 1_i64), &
-      work(w_rbox:w_X_trial - 1_i64), &
+      work(w_rbox:w_diag_box - 1_i64), &
+      work(w_diag_box:w_z_spg - 1_i64), &
+      work(w_z_spg:w_X_trial - 1_i64), &
       work(w_X_trial:w_GX - 1_i64), &
       work(w_GX:w_GX_trial - 1_i64), &
       work(w_GX_trial:w_rgrad_X - 1_i64), &
       work(w_rgrad_X:w_rgrad_old - 1_i64), &
       work(w_rgrad_old:w_eta_X - 1_i64), &
       work(w_eta_X:w_q_buf - 1_i64), &
-      work(w_q_buf:w_s_cur - 1_i64), &
+      work(w_q_buf:w_w_buf - 1_i64), &
+      work(w_w_buf:w_s_cur - 1_i64), &
       work(w_s_cur:w_y_cur - 1_i64), &
       work(w_y_cur:w_Aq_buf - 1_i64), &
       work(w_Aq_buf:w_gamma_blk - 1_i64), &
@@ -1421,6 +2057,58 @@ contains
       iwork(iw_cay_off:iw_ipiv_off - 1_i64), &
       iwork(iw_ipiv_off:iw_ipiv_all - 1_i64), &
       iwork(iw_ipiv_all:iw_ipiv_all + n_piv_pad - 1_i64))
+  end subroutine fc_solve_entry
+
+  !---------------------------------------------------------------------------
+  ! Public Native Fortran 2018 Master Solver Entry Point (100% v0.1.0 compatible).
+  !---------------------------------------------------------------------------
+  subroutine fc_solve( &
+      d, R, n_arr, p_arr, z, l, u, X_packed, eval_fg, udata, &
+      opts, work, lwork, iwork, liwork, res)
+    integer(i32), intent(in)       :: d, R
+    integer(i32), intent(in)       :: n_arr(*), p_arr(*)
+    real(dp), intent(inout)        :: z(*), X_packed(*)
+    real(dp), intent(in)           :: l(*), u(*)
+    procedure(fc_eval_fg_cb)       :: eval_fg
+    type(c_ptr), value, intent(in) :: udata
+    type(fc_options_t), intent(in) :: opts
+    real(dp), intent(inout)        :: work(*)
+    integer(i64), intent(in)       :: lwork
+    integer(i32), intent(inout)    :: iwork(*)
+    integer(i64), intent(in)       :: liwork
+    type(fc_result_t), intent(out) :: res
+
+    real(dp) :: dummy_a(1)
+
+    dummy_a(1) = 0.0_dp
+    call fc_solve_entry( &
+      .false., d, R, n_arr, p_arr, z, l, u, dummy_a, 0.0_dp, X_packed, &
+      eval_fg, udata, opts, work, lwork, iwork, liwork, res)
   end subroutine fc_solve
+
+  !---------------------------------------------------------------------------
+  ! Public Native Fortran 2018 Singly-Linearly-Constrained Box x Multi-Stiefel
+  ! Master Solver Entry Point (v0.2.0, 0 heap allocations).
+  !---------------------------------------------------------------------------
+  subroutine fc_solve_constrained( &
+      d, R, n_arr, p_arr, z, l, u, a, b, X_packed, eval_fg, udata, &
+      opts, work, lwork, iwork, liwork, res)
+    integer(i32), intent(in)       :: d, R
+    integer(i32), intent(in)       :: n_arr(*), p_arr(*)
+    real(dp), intent(inout)        :: z(*), X_packed(*)
+    real(dp), intent(in)           :: l(*), u(*), a(*), b
+    procedure(fc_eval_fg_cb)       :: eval_fg
+    type(c_ptr), value, intent(in) :: udata
+    type(fc_options_t), intent(in) :: opts
+    real(dp), intent(inout)        :: work(*)
+    integer(i64), intent(in)       :: lwork
+    integer(i32), intent(inout)    :: iwork(*)
+    integer(i64), intent(in)       :: liwork
+    type(fc_result_t), intent(out) :: res
+
+    call fc_solve_entry( &
+      .true., d, R, n_arr, p_arr, z, l, u, a, b, X_packed, &
+      eval_fg, udata, opts, work, lwork, iwork, liwork, res)
+  end subroutine fc_solve_constrained
 
 end module fortchuck_solver

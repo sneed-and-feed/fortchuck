@@ -3,7 +3,7 @@ program test_linalg_and_stiefel
   use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_positive_inf, ieee_quiet_nan
   use fortchuck_kinds, only: &
     dp, i32, FC_HUGE, FC_PI, &
-    FC_SUCCESS_QUERY, FC_ERR_INVALID_BOUNDS, &
+    FC_SUCCESS_QUERY, FC_ERR_INVALID_DIM, FC_ERR_INVALID_BOUNDS, FC_ERR_INFEASIBLE_LIN, &
     FC_METRIC_CANONICAL, FC_METRIC_EUCLIDEAN, FC_DAMP_CAUTIOUS, &
     FC_BOX_FREE, FC_BOX_ACTIVE, FC_BOX_FIXED, &
     fc_options_t, fc_result_t, fc_init_default_options, fc_init_result
@@ -13,13 +13,18 @@ program test_linalg_and_stiefel
     fc_lu_factor, fc_lu_solve, fc_lu_solve_trans, fc_lu_solve_right, fc_geqrf_pos
   use fortchuck_box, only: &
     fc_box_validate, fc_box_project, fc_box_kkt_residual, &
-    fc_box_partition, fc_box_active_step, fc_box_dir_deriv0, fc_box_trial_step
+    fc_box_partition, fc_box_active_step, fc_box_active_step_diag, &
+    fc_box_breakpoint_cap, fc_box_dir_deriv0, fc_box_trial_step, &
+    fc_box_lin_validate, fc_box_lin_project, fc_box_lin_kkt_residual, &
+    fc_box_lin_partition, fc_box_lin_trial_step
   use fortchuck_stiefel, only: &
     fc_stiefel_offsets, fc_stiefel_rgrad, fc_stiefel_proj_tangent, &
     fc_stiefel_inner, fc_stiefel_orth_err, fc_stiefel_orth_mat, &
-    fc_cayley_setup, fc_cayley_retract, fc_cayley_transport_vec, &
-    fc_cayley_setup_branch_a, fc_cayley_retract_branch_a, fc_cayley_transport_branch_a, &
-    fc_cayley_setup_branch_b, fc_cayley_retract_branch_b, fc_cayley_transport_branch_b
+    fc_cayley_setup, fc_cayley_retract, fc_cayley_transport_vec, fc_cayley_transport_batch, &
+    fc_cayley_setup_branch_a, fc_cayley_retract_branch_a, &
+    fc_cayley_transport_branch_a, fc_cayley_transport_batch_branch_a, &
+    fc_cayley_setup_branch_b, fc_cayley_retract_branch_b, &
+    fc_cayley_transport_branch_b, fc_cayley_transport_batch_branch_b
   implicit none (type, external)
 
   integer(i32) :: rng_state
@@ -29,9 +34,13 @@ program test_linalg_and_stiefel
   call test_structs_and_kinds()
   call test_gemm_syrk_frob()
   call test_lu_and_right_solve()
+  call test_gemm_and_lu_register_tiles()
   call test_geqrf_pos_properties()
   call test_box_overflow_and_partition()
+  call test_box_diag_and_breakpoints()
+  call test_box_lin_suite()
   call test_stiefel_geometry_and_cayley_parity()
+  call test_cayley_transport_batch_parity()
 
   write (*, '(A)') '[PASS] test_linalg_and_stiefel: all assertions passed.'
 
@@ -119,6 +128,7 @@ contains
     call check_true(opts%metric == FC_METRIC_CANONICAL, 'default canonical metric')
     call check_true(opts%damping_mode == FC_DAMP_CAUTIOUS, 'default cautious damping')
     call check_true(res%status == FC_SUCCESS_QUERY, 'default result status')
+    call check_true(FC_ERR_INFEASIBLE_LIN == -10_i32, 'FC_ERR_INFEASIBLE_LIN == -10')
   end subroutine test_structs_and_kinds
 
   !---------------------------------------------------------------------------
@@ -627,5 +637,756 @@ contains
         arena_p2(1:p2,  4), arena_p2(1:p2,  5), arena_p2(1:p2,  6))
     end do
   end subroutine test_stiefel_geometry_and_cayley_parity
+
+  !---------------------------------------------------------------------------
+  ! 7. v0.2.0 Odd/prime cache-blocked & 4x4/1x4 register-tiled GEMM and
+  !    4-RHS division-hoisted LU / LU-transpose accuracy across
+  !    m, n, k, nrhs in {1, 2, 3, 4, 5, 7, 16, 65, 131}
+  !---------------------------------------------------------------------------
+  subroutine check_gemm_case_slices(m, n, k, lda, ldb, ldc, A, ka, B, kb, C1, C2)
+    integer(i32), intent(in) :: m, n, k, lda, ldb, ldc, ka, kb
+    real(dp), intent(inout)  :: A(lda, ka), B(ldb, kb), C1(ldc, n), C2(ldc, n)
+
+    integer(i32) :: i, j, l
+    real(dp)     :: acc, diff_sq, ref_sq, d
+
+    ! (a) fc_gemm_nn: beta = 0 and beta /= 0
+    call fill_rand_mat(lda, ka, A, rng_state)
+    call fill_rand_mat(ldb, kb, B, rng_state)
+    C1 = -77.0_dp
+    call fc_gemm_nn(m, n, k, 1.35_dp, A, lda, B, ldb, 0.0_dp, C1, ldc)
+    diff_sq = 0.0_dp
+    ref_sq  = 0.0_dp
+    do j = 1_i32, n
+      do i = 1_i32, m
+        acc = 0.0_dp
+        do l = 1_i32, k
+          acc = acc + A(i, l) * B(l, j)
+        end do
+        C2(i, j) = 1.35_dp * acc
+        d        = C1(i, j) - C2(i, j)
+        diff_sq  = diff_sq + d * d
+        ref_sq   = ref_sq + C2(i, j) * C2(i, j)
+      end do
+    end do
+    call check_true(sqrt(diff_sq) <= 1.0e-14_dp * (1.0_dp + sqrt(ref_sq)), &
+      'fc_gemm_nn tiled odd/prime beta=0')
+
+    call fill_rand_mat(ldc, n, C1, rng_state)
+    C2 = C1
+    call fc_gemm_nn(m, n, k, -0.85_dp, A, lda, B, ldb, 0.45_dp, C1, ldc)
+    diff_sq = 0.0_dp
+    ref_sq  = 0.0_dp
+    do j = 1_i32, n
+      do i = 1_i32, m
+        acc = 0.0_dp
+        do l = 1_i32, k
+          acc = acc + A(i, l) * B(l, j)
+        end do
+        C2(i, j) = 0.45_dp * C2(i, j) - 0.85_dp * acc
+        d        = C1(i, j) - C2(i, j)
+        diff_sq  = diff_sq + d * d
+        ref_sq   = ref_sq + C2(i, j) * C2(i, j)
+      end do
+    end do
+    call check_true(sqrt(diff_sq) <= 1.0e-14_dp * (1.0_dp + sqrt(ref_sq)), &
+      'fc_gemm_nn tiled odd/prime beta/=0')
+
+    ! (b) fc_gemm_tn: A is k x m (lda >= k), B is k x n (ldb >= k)
+    call fill_rand_mat(lda, ka, A, rng_state)
+    call fill_rand_mat(ldb, kb, B, rng_state)
+    C1 = 42.0_dp
+    call fc_gemm_tn(m, n, k, 1.75_dp, A, lda, B, ldb, 0.0_dp, C1, ldc)
+    diff_sq = 0.0_dp
+    ref_sq  = 0.0_dp
+    do j = 1_i32, n
+      do i = 1_i32, m
+        acc = 0.0_dp
+        do l = 1_i32, k
+          acc = acc + A(l, i) * B(l, j)
+        end do
+        C2(i, j) = 1.75_dp * acc
+        d        = C1(i, j) - C2(i, j)
+        diff_sq  = diff_sq + d * d
+        ref_sq   = ref_sq + C2(i, j) * C2(i, j)
+      end do
+    end do
+    call check_true(sqrt(diff_sq) <= 1.0e-14_dp * (1.0_dp + sqrt(ref_sq)), &
+      'fc_gemm_tn 4x4 micro-kernel odd/prime beta=0')
+
+    call fill_rand_mat(ldc, n, C1, rng_state)
+    C2 = C1
+    call fc_gemm_tn(m, n, k, -1.15_dp, A, lda, B, ldb, -0.6_dp, C1, ldc)
+    diff_sq = 0.0_dp
+    ref_sq  = 0.0_dp
+    do j = 1_i32, n
+      do i = 1_i32, m
+        acc = 0.0_dp
+        do l = 1_i32, k
+          acc = acc + A(l, i) * B(l, j)
+        end do
+        C2(i, j) = -0.6_dp * C2(i, j) - 1.15_dp * acc
+        d        = C1(i, j) - C2(i, j)
+        diff_sq  = diff_sq + d * d
+        ref_sq   = ref_sq + C2(i, j) * C2(i, j)
+      end do
+    end do
+    call check_true(sqrt(diff_sq) <= 1.0e-14_dp * (1.0_dp + sqrt(ref_sq)), &
+      'fc_gemm_tn 4x4 micro-kernel odd/prime beta/=0')
+
+    ! (c) fc_gemm_nt: A is m x k (lda >= m), B is n x k (ldb >= n)
+    call fill_rand_mat(lda, ka, A, rng_state)
+    call fill_rand_mat(ldb, kb, B, rng_state)
+    call fill_rand_mat(ldc, n, C1, rng_state)
+    C2 = C1
+    call fc_gemm_nt(m, n, k, 0.95_dp, A, lda, B, ldb, -0.35_dp, C1, ldc)
+    diff_sq = 0.0_dp
+    ref_sq  = 0.0_dp
+    do j = 1_i32, n
+      do i = 1_i32, m
+        acc = 0.0_dp
+        do l = 1_i32, k
+          acc = acc + A(i, l) * B(j, l)
+        end do
+        C2(i, j) = -0.35_dp * C2(i, j) + 0.95_dp * acc
+        d        = C1(i, j) - C2(i, j)
+        diff_sq  = diff_sq + d * d
+        ref_sq   = ref_sq + C2(i, j) * C2(i, j)
+      end do
+    end do
+    call check_true(sqrt(diff_sq) <= 1.0e-14_dp * (1.0_dp + sqrt(ref_sq)), &
+      'fc_gemm_nt 1x4 micro-kernel odd/prime beta/=0')
+  end subroutine check_gemm_case_slices
+
+  subroutine check_lu_panel_case(n, nrhs, A, LU, B, X_sol, Prod, ipiv)
+    integer(i32), intent(in)  :: n, nrhs
+    real(dp), intent(inout)   :: A(n, n), LU(n, n), B(n, nrhs), X_sol(n, nrhs), Prod(n, nrhs)
+    integer(i32), intent(out) :: ipiv(n)
+
+    integer(i32) :: i, j, r1, r2, info
+    real(dp)     :: tmp_val, scale_ref
+
+    call fill_rand_mat(n, n, A, rng_state)
+    do i = 1_i32, n
+      A(i, i) = A(i, i) + 3.0_dp + 0.25_dp * sqrt(real(n, dp))
+    end do
+    ! Cyclically swap several row pairs to force nontrivial partial-pivoting ipiv swaps
+    if (n >= 2_i32) then
+      do i = 1_i32, min(n / 2_i32, 8_i32)
+        r1 = i
+        r2 = n - i + 1_i32
+        do j = 1_i32, n
+          tmp_val   = A(r1, j)
+          A(r1, j)  = A(r2, j)
+          A(r2, j)  = tmp_val
+        end do
+      end do
+    end if
+
+    LU = A
+    call fc_lu_factor(n, LU, ipiv, 1.0e-12_dp, info)
+    call check_true(info == 0_i32, 'fc_lu_factor nonsingular across {1..131}')
+
+    call fill_rand_mat(n, nrhs, B, rng_state)
+
+    X_sol = B
+    call fc_lu_solve(n, nrhs, LU, ipiv, X_sol)
+    call fc_gemm_nn(n, nrhs, n, 1.0_dp, A, n, X_sol, n, 0.0_dp, Prod, n)
+    scale_ref = fc_frob_norm(n, n, A) * fc_frob_norm(n, nrhs, X_sol) + fc_frob_norm(n, nrhs, B)
+    call check_true(mat_diff_frob(n, nrhs, Prod, B) <= 1.0e-14_dp * scale_ref, &
+      'fc_lu_solve 4-RHS panel residual <= 1e-14')
+
+    X_sol = B
+    call fc_lu_solve_trans(n, nrhs, LU, ipiv, X_sol)
+    call fc_gemm_tn(n, nrhs, n, 1.0_dp, A, n, X_sol, n, 0.0_dp, Prod, n)
+    scale_ref = fc_frob_norm(n, n, A) * fc_frob_norm(n, nrhs, X_sol) + fc_frob_norm(n, nrhs, B)
+    call check_true(mat_diff_frob(n, nrhs, Prod, B) <= 1.0e-14_dp * scale_ref, &
+      'fc_lu_solve_trans 4-RHS panel residual <= 1e-14')
+  end subroutine check_lu_panel_case
+
+  subroutine test_gemm_and_lu_register_tiles()
+    integer(i32), parameter :: dims_all(9) = [1_i32, 2_i32, 3_i32, 4_i32, 5_i32, &
+                                              7_i32, 16_i32, 65_i32, 131_i32]
+    integer(i32), parameter :: n_big = 14_i32
+    integer(i32), parameter :: bm(n_big) = [65_i32, 65_i32, 5_i32, 131_i32, 7_i32, &
+      65_i32, 131_i32, 131_i32, 1_i32, 131_i32, 131_i32, 4_i32, 16_i32, 65_i32]
+    integer(i32), parameter :: bn(n_big) = [65_i32, 5_i32, 65_i32, 7_i32, 131_i32, &
+      131_i32, 65_i32, 131_i32, 131_i32, 1_i32, 131_i32, 131_i32, 65_i32, 16_i32]
+    integer(i32), parameter :: bk(n_big) = [65_i32, 131_i32, 131_i32, 65_i32, 65_i32, &
+      7_i32, 5_i32, 131_i32, 131_i32, 131_i32, 1_i32, 65_i32, 131_i32, 131_i32]
+    integer(i32), parameter :: max_buf = 140_i32 * 140_i32
+
+    real(dp), allocatable :: A_buf(:), B_buf(:), C1_buf(:), C2_buf(:), P_buf(:)
+    integer(i32)          :: ipiv(140)
+    integer(i32)          :: im, in_idx, ik, idx, m, n, k, nrhs
+    integer(i32)          :: ld_max, col_max, sz_ab, sz_c, n2, n_rhs_sz
+
+    allocate(A_buf(max_buf), B_buf(max_buf), C1_buf(max_buf), C2_buf(max_buf), P_buf(max_buf))
+
+    ! Exhaustive small/odd/prime/4x4 register-tile sweep over {1, 2, 3, 4, 5, 7, 16}
+    do im = 1_i32, 7_i32
+      m = dims_all(im)
+      do in_idx = 1_i32, 7_i32
+        n = dims_all(in_idx)
+        do ik = 1_i32, 7_i32
+          k       = dims_all(ik)
+          ld_max  = max(m, max(n, k)) + mod(im + ik, 3_i32)
+          col_max = max(m, max(n, k))
+          sz_ab   = ld_max * col_max
+          sz_c    = (m + mod(in_idx, 2_i32)) * n
+          call check_gemm_case_slices(m, n, k, ld_max, ld_max, m + mod(in_idx, 2_i32), &
+            A_buf(1:sz_ab), col_max, B_buf(1:sz_ab), col_max, C1_buf(1:sz_c), C2_buf(1:sz_c))
+        end do
+      end do
+    end do
+
+    ! L1/L2 cache-block boundary & large prime combinations across 65 and 131
+    do idx = 1_i32, n_big
+      m       = bm(idx)
+      n       = bn(idx)
+      k       = bk(idx)
+      ld_max  = max(m, max(n, k)) + 3_i32
+      col_max = max(m, max(n, k))
+      sz_ab   = ld_max * col_max
+      sz_c    = (m + 2_i32) * n
+      call check_gemm_case_slices(m, n, k, ld_max, ld_max, m + 2_i32, &
+        A_buf(1:sz_ab), col_max, B_buf(1:sz_ab), col_max, C1_buf(1:sz_c), C2_buf(1:sz_c))
+    end do
+
+    ! Multi-RHS LU and LU-transpose across all (n, nrhs) in {1, 2, 3, 4, 5, 7, 16, 65, 131}
+    do im = 1_i32, 9_i32
+      n  = dims_all(im)
+      n2 = n * n
+      do in_idx = 1_i32, 9_i32
+        nrhs     = dims_all(in_idx)
+        n_rhs_sz = n * nrhs
+        call check_lu_panel_case(n, nrhs, &
+          A_buf(1:n2), B_buf(1:n2), C1_buf(1:n_rhs_sz), C2_buf(1:n_rhs_sz), &
+          P_buf(1:n_rhs_sz), ipiv(1:n))
+      end do
+    end do
+
+    deallocate(A_buf, B_buf, C1_buf, C2_buf, P_buf)
+  end subroutine test_gemm_and_lu_register_tiles
+
+  !---------------------------------------------------------------------------
+  ! 8. v0.2.0 Diagonal active-band step and overflow-safe free breakpoint cap
+  !---------------------------------------------------------------------------
+  subroutine test_box_diag_and_breakpoints()
+    integer(i32), parameter :: d = 7_i32
+    real(dp)     :: z(d), l(d), u(d), gz(d), diag_box(d), s_prev(d), y_prev(d), dz(d)
+    real(dp)     :: tau_min, tau_max, pinf
+    integer(i32) :: mask_box(d), n_hit
+
+    pinf = ieee_value(1.0_dp, ieee_positive_inf)
+
+    l        = [0.0_dp,  0.0_dp,  2.0_dp, -FC_HUGE,  0.0_dp, -1.0_dp,  0.0_dp]
+    l(5)     = -pinf
+    u        = [10.0_dp, 10.0_dp, 2.0_dp,  FC_HUGE,  5.0_dp,  FC_HUGE, 4.0_dp]
+    z        = [1.0_dp,  0.0_dp,  2.0_dp,  0.0_dp,   1.0_dp,  0.5_dp,  1.0_dp]
+    gz       = [2.0_dp,  3.0_dp, -5.0_dp,  1.0_dp,  -2.0_dp,  4.0_dp, -2.0_dp]
+    diag_box = [0.25_dp, 50.0_dp, 1.0_dp,  1.0_dp,   0.001_dp, 0.5_dp, 0.8_dp]
+    s_prev   = [0.2_dp,  0.0_dp,  0.0_dp,  0.0_dp,   0.0_dp,   0.3_dp, 0.4_dp]
+    y_prev   = [0.1_dp,  0.0_dp,  0.0_dp,  0.0_dp,   0.0_dp,   0.6_dp, 0.2_dp]
+    mask_box = [FC_BOX_FREE, FC_BOX_ACTIVE, FC_BOX_FIXED, FC_BOX_FREE, &
+                FC_BOX_ACTIVE, FC_BOX_ACTIVE, FC_BOX_FREE]
+    dz       = [-0.5_dp, 99.0_dp, 99.0_dp, 3.0_dp, 99.0_dp, 99.0_dp, 1.5_dp]
+
+    call fc_box_active_step_diag(d, z, l, u, gz, mask_box, diag_box, &
+      0.05_dp, 10.0_dp, .true., s_prev, y_prev, dz)
+
+    ! Coord 1 FREE: preserved (-0.5)
+    call check_true(abs(dz(1) + 0.5_dp) <= 1.0e-15_dp, 'active_step_diag preserves FREE')
+    ! Coord 2 ACTIVE, s_prev=0 -> uses clip(diag_box(2)=50, 0.05, 10.0) = 10.0 -> dz = -30.0
+    call check_true(abs(dz(2) + 30.0_dp) <= 1.0e-15_dp, 'active_step_diag clips diag_box upper')
+    ! Coord 3 FIXED -> 0.0
+    call check_true(abs(dz(3)) <= 1.0e-16_dp, 'active_step_diag zeroes FIXED')
+    ! Coord 5 ACTIVE, s_prev=0 -> uses clip(diag_box(5)=0.001, 0.05, 10.0) = 0.05 -> dz = +0.1
+    call check_true(abs(dz(5) - 0.1_dp) <= 1.0e-15_dp, 'active_step_diag clips diag_box lower')
+    ! Coord 6 ACTIVE, valid secant s/y = 0.3/0.6 = 0.5 -> dz = -0.5 * 4 = -2.0
+    call check_true(abs(dz(6) + 2.0_dp) <= 1.0e-15_dp, 'active_step_diag uses secant ratio')
+
+    ! Breakpoints across FREE coords {1, 4, 7}:
+    !   Coord 1: z=1, l=0, dz=-0.5 -> tau = (0 - 1)/(-0.5) = 2.0
+    !   Coord 4: z=0, u=+FC_HUGE, dz=+3 -> unbounded wall skipped!
+    !   Coord 7: z=1, u=4, dz=+1.5 -> tau = (4 - 1)/1.5 = 2.0? Adjust dz(7)=0.5 -> tau = 6.0!
+    dz(7) = 0.5_dp
+    call fc_box_breakpoint_cap(d, z, l, u, mask_box, dz, tau_min, tau_max, n_hit)
+    call check_true(n_hit == 2_i32, 'fc_box_breakpoint_cap counts finite free walls only')
+    call check_true(abs(tau_min - 2.0_dp) <= 1.0e-15_dp, 'fc_box_breakpoint_cap tau_brk_min == 2')
+    call check_true(abs(tau_max - 6.0_dp) <= 1.0e-15_dp, 'fc_box_breakpoint_cap tau_brk_max == 6')
+  end subroutine test_box_diag_and_breakpoints
+
+  !---------------------------------------------------------------------------
+  ! 9. v0.2.0 Singly-linearly-constrained box & simplex projection, KKT,
+  !    active-face partition, trial step, overflow guards, & variational ineq.
+  !---------------------------------------------------------------------------
+  subroutine assert_lin_proj_vi(d, l, u, a, b, y, z_star)
+    integer(i32), intent(in) :: d
+    real(dp), intent(in)     :: l(d), u(d), a(d), b, y(d), z_star(d)
+
+    integer(i32) :: i, s_idx
+    real(dp)     :: az, a_l1, z_inf, tol_eq, b_min, b_max
+    real(dp)     :: z_lo(80), z_hi(80), w(80), z_feas(80)
+    real(dp)     :: li_eff, ui_eff, u01, aw, theta, vi_dot, nrm_yz, nrm_dz
+
+    az    = 0.0_dp
+    a_l1  = 0.0_dp
+    z_inf = 0.0_dp
+    b_min = 0.0_dp
+    b_max = 0.0_dp
+
+    do i = 1_i32, d
+      call check_true(z_star(i) >= l(i) - 1.0e-15_dp .and. z_star(i) <= u(i) + 1.0e-15_dp, &
+        'fc_box_lin_project box feasibility l <= z* <= u')
+      az    = az + a(i) * z_star(i)
+      a_l1  = a_l1 + abs(a(i))
+      z_inf = max(z_inf, abs(z_star(i)))
+
+      ! Finite sampling box around z_star for independent geometric feasible test points
+      li_eff = max(l(i), z_star(i) - 10.0_dp)
+      ui_eff = min(u(i), z_star(i) + 10.0_dp)
+      if (a(i) > 0.0_dp) then
+        z_lo(i) = li_eff
+        z_hi(i) = ui_eff
+        b_min   = b_min + a(i) * li_eff
+        b_max   = b_max + a(i) * ui_eff
+      else if (a(i) < 0.0_dp) then
+        z_lo(i) = ui_eff
+        z_hi(i) = li_eff
+        b_min   = b_min + a(i) * ui_eff
+        b_max   = b_max + a(i) * li_eff
+      else
+        z_lo(i) = 0.5_dp * (li_eff + ui_eff)
+        z_hi(i) = z_lo(i)
+      end if
+    end do
+
+    tol_eq = 1.0e-14_dp * (1.0_dp + abs(b) + a_l1 * z_inf)
+    call check_true(abs(az - b) <= tol_eq, &
+      'fc_box_lin_project equality |a^T z* - b| <= 1e-14*(1+|b|+||a||_1*||z*||_inf)')
+
+    ! Independent geometric convex-combination feasible points z_feas in C (0 calls to projector!)
+    do s_idx = 1_i32, 20_i32
+      aw = 0.0_dp
+      do i = 1_i32, d
+        u01  = 0.5_dp * (next_rand(rng_state) + 1.0_dp)
+        w(i) = min(z_lo(i), z_hi(i)) + u01 * abs(z_hi(i) - z_lo(i))
+        aw   = aw + a(i) * w(i)
+      end do
+      if (aw >= b .and. aw > b_min + 1.0e-15_dp) then
+        theta = min(1.0_dp, max(0.0_dp, (b - b_min) / (aw - b_min)))
+        do i = 1_i32, d
+          z_feas(i) = theta * w(i) + (1.0_dp - theta) * z_lo(i)
+        end do
+      else if (aw < b .and. b_max > aw + 1.0e-15_dp) then
+        theta = min(1.0_dp, max(0.0_dp, (b_max - b) / (b_max - aw)))
+        do i = 1_i32, d
+          z_feas(i) = theta * w(i) + (1.0_dp - theta) * z_hi(i)
+        end do
+      else
+        do i = 1_i32, d
+          z_feas(i) = z_lo(i)
+        end do
+      end if
+
+      vi_dot = 0.0_dp
+      nrm_yz = 0.0_dp
+      nrm_dz = 0.0_dp
+      do i = 1_i32, d
+        vi_dot = vi_dot + (y(i) - z_star(i)) * (z_feas(i) - z_star(i))
+        nrm_yz = nrm_yz + (y(i) - z_star(i)) * (y(i) - z_star(i))
+        nrm_dz = nrm_dz + (z_feas(i) - z_star(i)) * (z_feas(i) - z_star(i))
+      end do
+      call check_true(vi_dot <= 1.0e-14_dp * (1.0_dp + sqrt(nrm_yz * nrm_dz)), &
+        'fc_box_lin_project variational inequality <y - z*, z - z*> <= 1e-14')
+    end do
+  end subroutine assert_lin_proj_vi
+
+  subroutine test_box_lin_suite()
+    real(dp)     :: l75(75), u75(75), a75(75), y75(75), z75(75)
+    real(dp)     :: l8(8), u8(8), a8(8), y8(8), z8(8), gz8(8), zp8(8), rb8(8), dz8(8), zt8(8)
+    real(dp)     :: nu_out, b_val, b_lo, b_hi, pinf, qnan, aa, ay
+    real(dp)     :: box_inf, box_l2, delta_b, chord_gz, step_sq, chk_sum
+    integer(i32) :: mask8(8), status, n_act, i, inst
+
+    pinf = ieee_value(1.0_dp, ieee_positive_inf)
+    qnan = ieee_value(1.0_dp, ieee_quiet_nan)
+
+    ! 1. Unit simplex d = 75 (interior identity + exterior sparse projection)
+    l75 = 0.0_dp
+    u75 = 1.0_dp
+    a75 = 1.0_dp
+    chk_sum = 0.0_dp
+    do i = 1_i32, 75_i32
+      y75(i)  = real(i, dp)
+      chk_sum = chk_sum + y75(i)
+    end do
+    y75 = y75 / chk_sum
+    z75 = y75
+    call fc_box_lin_validate(75_i32, l75, u75, a75, 1.0_dp, status)
+    call check_true(status == 0_i32, 'fc_box_lin_validate unit simplex d=75')
+    call fc_box_lin_project(75_i32, l75, u75, a75, 1.0_dp, z75, nu_out, status)
+    call check_true(status == 0_i32, 'fc_box_lin_project interior simplex status==0')
+    call check_true(mat_diff_frob(75_i32, 1_i32, z75, y75) <= 1.0e-14_dp, &
+      'fc_box_lin_project interior simplex fixed point')
+
+    do i = 1_i32, 75_i32
+      y75(i) = 4.0_dp * next_rand(rng_state)
+    end do
+    z75 = y75
+    call fc_box_lin_project(75_i32, l75, u75, a75, 1.0_dp, z75, nu_out, status)
+    call check_true(status == 0_i32, 'fc_box_lin_project exterior simplex status==0')
+    call assert_lin_proj_vi(75_i32, l75, u75, a75, 1.0_dp, y75, z75)
+
+    ! 2. Unbounded & one-sided +-FC_HUGE / +-Inf with a_i == 0 under -ffpe-trap=overflow
+    !    (a) Full unbounded hyperplane: exact orthogonal projection y - ((a^T y - b)/||a||^2)*a
+    l8 = -FC_HUGE
+    u8 =  FC_HUGE
+    a8 = [2.0_dp, -1.5_dp, 0.0_dp, 4.0_dp, -0.5_dp, 0.0_dp, 1.25_dp, -3.0_dp]
+    y8 = [5.0_dp, -3.0_dp, 9.0_dp, 1.0_dp,  2.0_dp, -8.0_dp, 0.5_dp,  4.0_dp]
+    b_val = 3.75_dp
+    z8 = y8
+    call fc_box_lin_validate(8_i32, l8, u8, a8, b_val, status)
+    call check_true(status == 0_i32, 'fc_box_lin_validate unbounded +-FC_HUGE with a_i=0')
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_val, z8, nu_out, status)
+    call check_true(status == 0_i32, 'fc_box_lin_project unbounded hyperplane status==0')
+    aa = 0.0_dp
+    ay = 0.0_dp
+    do i = 1_i32, 8_i32
+      aa = aa + a8(i) * a8(i)
+      ay = ay + a8(i) * y8(i)
+    end do
+    do i = 1_i32, 8_i32
+      zp8(i) = y8(i) - ((ay - b_val) / aa) * a8(i)
+    end do
+    call check_true(mat_diff_frob(8_i32, 1_i32, z8, zp8) <= 1.0e-14_dp, &
+      'fc_box_lin_project exact orthogonal hyperplane projection')
+
+    !    (b) One-sided [0, +FC_HUGE) & (-Inf, u] with a_i == 0 and +-FC_HUGE bounds
+    l8 = [0.0_dp, -FC_HUGE, -FC_HUGE,  0.0_dp,  0.0_dp,  1.5_dp,  0.0_dp, -2.0_dp]
+    l8(5) = -pinf
+    u8 = [FC_HUGE, 2.0_dp,   FC_HUGE,  0.0_dp,  3.0_dp,  1.5_dp,  4.0_dp,  2.0_dp]
+    u8(4) = pinf
+    a8 = [1.5_dp, -2.0_dp,   0.0_dp,   0.75_dp, -1.0_dp, 2.0_dp, 0.5_dp, -1.25_dp]
+    y8 = [-4.0_dp, 7.0_dp,   3.5_dp,  -2.0_dp,  8.0_dp, 9.0_dp,  6.0_dp, -5.0_dp]
+    b_val = 6.5_dp
+    z8 = y8
+    call fc_box_lin_validate(8_i32, l8, u8, a8, b_val, status)
+    call check_true(status == 0_i32, 'fc_box_lin_validate one-sided +-FC_HUGE/Inf')
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_val, z8, nu_out, status)
+    call check_true(status == 0_i32, 'fc_box_lin_project one-sided +-FC_HUGE/Inf')
+    call check_true(abs(z8(3) - 3.5_dp) <= 1.0e-15_dp, 'a_i==0 coord keeps clamped y_i')
+    call check_true(abs(z8(6) - 1.5_dp) <= 1.0e-15_dp, 'fixed l_i==u_i coord exact')
+    call assert_lin_proj_vi(8_i32, l8, u8, a8, b_val, y8, z8)
+
+    ! 3. Singleton boundary faces b == b_min and b == b_max with signed a_i and a_i == 0
+    l8 = [-1.0_dp, 0.0_dp, -2.0_dp,  0.5_dp, -3.0_dp, 1.0_dp, -0.5_dp, 0.0_dp]
+    u8 = [ 2.0_dp, 3.0_dp,  4.0_dp,  2.5_dp,  1.0_dp, 1.0_dp,  1.5_dp, 2.0_dp]
+    a8 = [ 2.0_dp, -1.5_dp, 0.0_dp,  3.0_dp, -0.5_dp, 4.0_dp,  1.0_dp, -2.0_dp]
+    b_lo = 0.0_dp
+    b_hi = 0.0_dp
+    do i = 1_i32, 8_i32
+      if (a8(i) > 0.0_dp) then
+        b_lo = b_lo + a8(i) * l8(i)
+        b_hi = b_hi + a8(i) * u8(i)
+      else if (a8(i) < 0.0_dp) then
+        b_lo = b_lo + a8(i) * u8(i)
+        b_hi = b_hi + a8(i) * l8(i)
+      end if
+    end do
+    y8 = [0.7_dp, 1.1_dp, 9.0_dp, 1.2_dp, -0.4_dp, 1.0_dp, 0.2_dp, 0.9_dp]
+    z8 = y8
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_lo, z8, nu_out, status)
+    call check_true(status == 0_i32, 'singleton b == b_min status==0')
+    call check_true(abs(z8(1) - l8(1)) <= 1.0e-15_dp .and. abs(z8(2) - u8(2)) <= 1.0e-15_dp, &
+      'singleton b == b_min hits signed lower/upper vertex')
+    call check_true(abs(z8(3) - u8(3)) <= 1.0e-15_dp, &
+      'singleton b == b_min clamps a_i==0 coord to [l_i, u_i]')
+    call assert_lin_proj_vi(8_i32, l8, u8, a8, b_lo, y8, z8)
+
+    z8 = y8
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_hi, z8, nu_out, status)
+    call check_true(status == 0_i32, 'singleton b == b_max status==0')
+    call check_true(abs(z8(1) - u8(1)) <= 1.0e-15_dp .and. abs(z8(2) - l8(2)) <= 1.0e-15_dp, &
+      'singleton b == b_max hits signed upper/lower vertex')
+    call assert_lin_proj_vi(8_i32, l8, u8, a8, b_hi, y8, z8)
+
+    ! 4. Infeasible and invalid error returns (FC_ERR_INFEASIBLE_LIN = -10)
+    call fc_box_lin_validate(8_i32, l8, u8, a8, b_lo - 1.0e-4_dp, status)
+    call check_true(status == FC_ERR_INFEASIBLE_LIN, 'rejects b < b_min with FC_ERR_INFEASIBLE_LIN')
+    z8 = y8
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_hi + 1.0e-4_dp, z8, nu_out, status)
+    call check_true(status == FC_ERR_INFEASIBLE_LIN, 'project rejects b > b_max')
+    zp8 = 0.0_dp
+    call fc_box_lin_validate(8_i32, l8, u8, zp8, 0.0_dp, status)
+    call check_true(status == FC_ERR_INFEASIBLE_LIN, 'rejects zero normal vector a == 0')
+    call fc_box_lin_validate(8_i32, l8, u8, a8, qnan, status)
+    call check_true(status == FC_ERR_INFEASIBLE_LIN, 'rejects NaN rhs b')
+    call fc_box_lin_validate(8_i32, l8, u8, a8, pinf, status)
+    call check_true(status == FC_ERR_INFEASIBLE_LIN, 'rejects +Inf rhs b')
+    call fc_box_lin_validate(0_i32, l8, u8, a8, 0.0_dp, status)
+    call check_true(status == FC_ERR_INVALID_DIM, 'rejects d == 0 with FC_ERR_INVALID_DIM')
+
+    ! 5. Randomized 30-instance signed knapsack & extreme-scale variational inequality sweep
+    do inst = 1_i32, 30_i32
+      b_lo = 0.0_dp
+      b_hi = 0.0_dp
+      do i = 1_i32, 25_i32
+        l75(i) = 2.0_dp * next_rand(rng_state) - 1.0_dp
+        u75(i) = l75(i) + 0.2_dp + 3.0_dp * abs(next_rand(rng_state))
+        a75(i) = next_rand(rng_state) * (10.0_dp ** (2.0_dp * next_rand(rng_state)))
+        if (mod(inst + i, 9_i32) == 0_i32) a75(i) = 0.0_dp
+        y75(i) = 6.0_dp * next_rand(rng_state)
+        if (a75(i) > 0.0_dp) then
+          b_lo = b_lo + a75(i) * l75(i)
+          b_hi = b_hi + a75(i) * u75(i)
+        else if (a75(i) < 0.0_dp) then
+          b_lo = b_lo + a75(i) * u75(i)
+          b_hi = b_hi + a75(i) * l75(i)
+        end if
+      end do
+      b_val = b_lo + (0.05_dp + 0.90_dp * 0.5_dp * (next_rand(rng_state) + 1.0_dp)) * (b_hi - b_lo)
+      z75(1:25) = y75(1:25)
+      call fc_box_lin_project(25_i32, l75(1:25), u75(1:25), a75(1:25), b_val, &
+        z75(1:25), nu_out, status)
+      call check_true(status == 0_i32, 'random signed knapsack status == 0')
+      call assert_lin_proj_vi(25_i32, l75(1:25), u75(1:25), a75(1:25), b_val, &
+        y75(1:25), z75(1:25))
+    end do
+
+    ! 6. fc_box_lin_kkt_residual, fc_box_lin_partition, & fc_box_lin_trial_step
+    !    At z* = P_C(y), minimizing 0.5*||z - y||^2 has gradient gz = z* - y -> KKT residual == 0!
+    z8 = y8
+    b_val = 0.5_dp * (b_lo + b_hi)
+    ! Recompute b_lo, b_hi for l8, u8, a8
+    b_lo = 0.0_dp
+    b_hi = 0.0_dp
+    do i = 1_i32, 8_i32
+      if (a8(i) > 0.0_dp) then
+        b_lo = b_lo + a8(i) * l8(i)
+        b_hi = b_hi + a8(i) * u8(i)
+      else if (a8(i) < 0.0_dp) then
+        b_lo = b_lo + a8(i) * u8(i)
+        b_hi = b_hi + a8(i) * l8(i)
+      end if
+    end do
+    b_val = 0.4_dp * b_lo + 0.6_dp * b_hi
+    z8 = [4.0_dp, -3.0_dp, 1.5_dp, 5.0_dp, -4.0_dp, 1.0_dp, 2.5_dp, -1.0_dp]
+    zp8 = z8
+    call fc_box_lin_project(8_i32, l8, u8, a8, b_val, z8, nu_out, status)
+    call check_true(status == 0_i32, 'KKT setup projection status==0')
+    do i = 1_i32, 8_i32
+      gz8(i) = z8(i) - zp8(i)
+    end do
+    call fc_box_lin_kkt_residual(8_i32, z8, l8, u8, a8, b_val, gz8, &
+      zt8, rb8, nu_out, box_inf, box_l2, status)
+    call check_true(status == 0_i32, 'fc_box_lin_kkt_residual status==0')
+    call check_true(box_inf <= 1.0e-14_dp .and. box_l2 <= 1.0e-14_dp, &
+      'fc_box_lin_kkt_residual vanishes at exact constrained optimizer z*')
+
+    ! Partition with tiny boundary gap snap (<= 1e-12) and SPG trial step verification
+    l8  = 0.0_dp
+    u8  = 1.0_dp
+    a8  = 1.0_dp
+    b_val = 1.0_dp
+    z8  = [1.0e-13_dp, 0.5_dp - 1.0e-13_dp, 0.5_dp, 0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp, 0.0_dp]
+    gz8 = [5.0_dp, -2.0_dp, 1.0_dp, 4.0_dp, 3.0_dp, 6.0_dp, 2.0_dp, 2.5_dp]
+    call fc_box_lin_kkt_residual(8_i32, z8, l8, u8, a8, b_val, gz8, &
+      zp8, rb8, nu_out, box_inf, box_l2, status)
+    call check_true(status == 0_i32 .and. box_inf > 0.1_dp, &
+      'fc_box_lin_kkt_residual positive at non-stationary simplex point')
+    call fc_box_lin_partition(8_i32, z8, l8, u8, a8, gz8, nu_out, mask8, dz8, delta_b, n_act)
+    call check_true(mask8(1) == FC_BOX_ACTIVE, 'fc_box_lin_partition snaps 1e-13 lower gap ACTIVE')
+    call check_true(abs(dz8(1) + 1.0e-13_dp) <= 1.0e-25_dp, &
+      'fc_box_lin_partition sets exact snap step l_i - z_i')
+    call check_true(abs(delta_b - 1.0e-13_dp) <= 1.0e-25_dp, &
+      'fc_box_lin_partition delta_b == -sum_{active} a_i * dz_i')
+    call check_true(mask8(2) == FC_BOX_FREE .and. mask8(3) == FC_BOX_FREE, &
+      'fc_box_lin_partition keeps interior simplex coords FREE')
+
+    dz8 = -gz8
+    call fc_box_lin_trial_step(8_i32, z8, l8, u8, a8, b_val, gz8, dz8, 0.25_dp, &
+      zt8, chord_gz, step_sq, status)
+    call check_true(status == 0_i32, 'fc_box_lin_trial_step status==0')
+    call check_true(chord_gz < -1.0e-3_dp .and. step_sq > 1.0e-4_dp, &
+      'fc_box_lin_trial_step strict descent along SPG trial curve')
+    chk_sum = 0.0_dp
+    do i = 1_i32, 8_i32
+      chk_sum = chk_sum + zt8(i)
+    end do
+    call check_true(abs(chk_sum - 1.0_dp) <= 1.0e-14_dp, &
+      'fc_box_lin_trial_step preserves simplex equality sum(z_trial)==1')
+  end subroutine test_box_lin_suite
+
+  !---------------------------------------------------------------------------
+  ! 10. v0.2.0 Batched Level-3 Isometric Cayley Panel Transport Parity & Isometry
+  !     across (n, p) in {(10,1),(12,3),(8,4),(7,5),(6,6),(40,6),(16,16)}
+  !     and k_batch in {1, 5, 16} (+ k_batch = 0 and tau = 0 no-ops)
+  !---------------------------------------------------------------------------
+  subroutine verify_batch_transport_case(n, p, k_batch, X, eta, Y_a, Y_b, Y_auto, &
+      A_sk, scr_p2, XTz, YTza, Panel_init, Panel_ref, Panel_a, Panel_b, Panel_auto, &
+      cay_a, cay_b, cay_auto, scr_big)
+    integer(i32), intent(in) :: n, p, k_batch
+    real(dp), intent(inout)  :: X(n, p), eta(n, p), Y_a(n, p), Y_b(n, p), Y_auto(n, p)
+    real(dp), intent(inout)  :: A_sk(p, p), scr_p2(p, p), XTz(p, p), YTza(p, p)
+    real(dp), intent(inout)  :: Panel_init(n, p * k_batch), Panel_ref(n, p * k_batch)
+    real(dp), intent(inout)  :: Panel_a(n, p * k_batch), Panel_b(n, p * k_batch)
+    real(dp), intent(inout)  :: Panel_auto(n, p * k_batch)
+    real(dp), intent(inout)  :: cay_a(4096), cay_b(4096), cay_auto(4096), scr_big(*)
+
+    real(dp), parameter :: taus(4) = [0.0_dp, 0.05_dp, 0.7_dp, 2.3_dp]
+    real(dp)            :: tau_qr(20), work_qr(20), scr_p1(1)
+    integer(i32)        :: ipiv_a(40), ipiv_b(40), ipiv_auto(40)
+    integer(i32)        :: ncol, info_a, info_b, info_auto, t_idx, b_idx, b_next, c0, d0
+    real(dp)            :: tau, scale_z, in_can_x, in_can_y, in_euc_x, in_euc_y
+
+    ncol = p * k_batch
+    call fill_rand_mat(n, p, X, rng_state)
+    call fc_geqrf_pos(n, p, X, tau_qr(1:p), work_qr(1:p), info_a)
+    call check_true(info_a == 0_i32, 'batch transport base frame QR')
+
+    call fill_rand_mat(n, p, eta, rng_state)
+    call fc_stiefel_proj_tangent(n, p, X, eta, A_sk, scr_p2)
+
+    ! Generate k_batch normalized tangent blocks in Panel_init
+    do b_idx = 1_i32, k_batch
+      c0 = (b_idx - 1_i32) * p + 1_i32
+      call fill_rand_mat(n, p, Panel_init(1:n, c0:c0 + p - 1_i32), rng_state)
+      call fc_stiefel_proj_tangent(n, p, X, Panel_init(1:n, c0:c0 + p - 1_i32), A_sk, scr_p2)
+      scale_z = max(1.0_dp, fc_frob_norm(n, p, Panel_init(1:n, c0:c0 + p - 1_i32)))
+      Panel_init(1:n, c0:c0 + p - 1_i32) = Panel_init(1:n, c0:c0 + p - 1_i32) / &
+        (scale_z * sqrt(real(k_batch, dp)))
+    end do
+
+    call fc_cayley_setup_branch_a(n, p, X, eta, cay_a, scr_big)
+    call fc_cayley_setup_branch_b(n, p, X, eta, cay_b, scr_big)
+    call fc_cayley_setup(n, p, X, eta, cay_auto, scr_big)
+
+    ! Verify k_batch == 0 is a strict no-op
+    Panel_auto = Panel_init
+    call fc_cayley_transport_batch(n, p, 0_i32, X, eta, 0.7_dp, &
+      cay_auto, ipiv_auto, Panel_auto, scr_big)
+    call check_true(mat_diff_frob(n, ncol, Panel_auto, Panel_init) <= 0.0_dp, &
+      'fc_cayley_transport_batch k_batch==0 exact no-op')
+
+    do t_idx = 1_i32, 4_i32
+      tau = taus(t_idx)
+      call fc_cayley_retract_branch_a(n, p, X, eta, tau, cay_a, ipiv_a(1:p), Y_a, scr_big, info_a)
+      call fc_cayley_retract_branch_b(n, p, X, eta, tau, cay_b, ipiv_b(1:n), Y_b, scr_big, info_b)
+      call fc_cayley_retract(n, p, X, eta, tau, cay_auto, ipiv_auto, Y_auto, scr_big, info_auto)
+      call check_true(info_a == 0_i32 .and. info_b == 0_i32 .and. info_auto == 0_i32, &
+        'batch transport retract info == 0')
+      call check_true(mat_diff_frob(n, p, Y_a, Y_b) <= 1.0e-14_dp, &
+        'batch transport retract Branch A == Branch B <= 1e-14')
+
+      ! Reference: k_batch sequential calls to fc_cayley_transport_vec
+      Panel_ref = Panel_init
+      do b_idx = 1_i32, k_batch
+        c0 = (b_idx - 1_i32) * p + 1_i32
+        call fc_cayley_transport_vec(n, p, X, eta, tau, cay_auto, ipiv_auto, &
+          Panel_ref(1:n, c0:c0 + p - 1_i32), scr_big)
+      end do
+
+      Panel_a    = Panel_init
+      Panel_b    = Panel_init
+      Panel_auto = Panel_init
+
+      if (p == 1_i32) then
+        scr_p1(1) = 777.0_dp
+        call fc_cayley_transport_batch_branch_a(n, p, k_batch, X, eta, tau, &
+          cay_a, ipiv_a(1:p), Panel_a, scr_p1)
+        call check_true(.not. (abs(scr_p1(1) - 777.0_dp) > 0.0_dp), &
+          'fc_cayley_transport_batch_branch_a p==1 uses 0 scratch words')
+      else
+        call fc_cayley_transport_batch_branch_a(n, p, k_batch, X, eta, tau, &
+          cay_a, ipiv_a(1:p), Panel_a, scr_big)
+      end if
+
+      call fc_cayley_transport_batch_branch_b(n, p, k_batch, X, eta, tau, &
+        cay_b, ipiv_b(1:n), Panel_b, scr_big)
+      call fc_cayley_transport_batch(n, p, k_batch, X, eta, tau, &
+        cay_auto, ipiv_auto, Panel_auto, scr_big)
+
+      call check_true(mat_diff_frob(n, ncol, Panel_a, Panel_ref) <= 1.0e-14_dp, &
+        'fc_cayley_transport_batch_branch_a == k_batch x single <= 1e-14')
+      call check_true(mat_diff_frob(n, ncol, Panel_b, Panel_ref) <= 1.0e-14_dp, &
+        'fc_cayley_transport_batch_branch_b == k_batch x single <= 1e-14')
+      call check_true(mat_diff_frob(n, ncol, Panel_auto, Panel_ref) <= 1.0e-14_dp, &
+        'fc_cayley_transport_batch auto == k_batch x single <= 1e-14')
+
+      if (.not. (abs(tau) > 0.0_dp)) then
+        call check_true(mat_diff_frob(n, ncol, Panel_auto, Panel_init) <= 0.0_dp, &
+          'fc_cayley_transport_batch tau==0 exact no-op')
+      end if
+
+      ! Verify canonical & Euclidean inner-product isometry + skew invariance across batch
+      do b_idx = 1_i32, k_batch
+        b_next = mod(b_idx, k_batch) + 1_i32
+        c0     = (b_idx - 1_i32) * p + 1_i32
+        d0     = (b_next - 1_i32) * p + 1_i32
+
+        call fc_gemm_tn(p, p, n, 1.0_dp, X, n, Panel_init(1:n, c0:c0 + p - 1_i32), n, &
+          0.0_dp, XTz, p)
+        call fc_gemm_tn(p, p, n, 1.0_dp, Y_auto, n, Panel_auto(1:n, c0:c0 + p - 1_i32), n, &
+          0.0_dp, YTza, p)
+        call check_true(mat_diff_frob(p, p, YTza, XTz) <= 1.0e-14_dp, &
+          'batched Cayley transport preserves Y^T*T(zeta) == X^T*zeta')
+
+        in_can_x = fc_stiefel_inner(n, p, X, &
+          Panel_init(1:n, c0:c0 + p - 1_i32), Panel_init(1:n, d0:d0 + p - 1_i32), &
+          FC_METRIC_CANONICAL)
+        in_can_y = fc_stiefel_inner(n, p, Y_auto, &
+          Panel_auto(1:n, c0:c0 + p - 1_i32), Panel_auto(1:n, d0:d0 + p - 1_i32), &
+          FC_METRIC_CANONICAL)
+        call check_true(abs(in_can_y - in_can_x) <= 1.0e-14_dp, &
+          'batched Cayley transport canonical inner-product isometry <= 1e-14')
+
+        in_euc_x = fc_stiefel_inner(n, p, X, &
+          Panel_init(1:n, c0:c0 + p - 1_i32), Panel_init(1:n, d0:d0 + p - 1_i32), &
+          FC_METRIC_EUCLIDEAN)
+        in_euc_y = fc_stiefel_inner(n, p, Y_auto, &
+          Panel_auto(1:n, c0:c0 + p - 1_i32), Panel_auto(1:n, d0:d0 + p - 1_i32), &
+          FC_METRIC_EUCLIDEAN)
+        call check_true(abs(in_euc_y - in_euc_x) <= 1.0e-14_dp, &
+          'batched Cayley transport Euclidean inner-product isometry <= 1e-14')
+      end do
+    end do
+  end subroutine verify_batch_transport_case
+
+  subroutine test_cayley_transport_batch_parity()
+    integer(i32), parameter :: n_cases = 7_i32
+    integer(i32), parameter :: ns(n_cases) = [10_i32, 12_i32, 8_i32, 7_i32, 6_i32, 40_i32, 16_i32]
+    integer(i32), parameter :: ps(n_cases) = [ 1_i32,  3_i32, 4_i32, 5_i32, 6_i32,  6_i32, 16_i32]
+    integer(i32), parameter :: k_list(3)   = [ 1_i32,  5_i32, 16_i32]
+
+    real(dp), allocatable :: np_buf(:,:), p2_buf(:,:), pan_buf(:,:)
+    real(dp), allocatable :: cay_a(:), cay_b(:), cay_auto(:), scr_big(:)
+    integer(i32)          :: c_idx, k_idx, n, p, k_batch, np, p2, n_pan
+
+    ! Max np = 40*6 = 240 or 16*16 = 256; max p2 = 256; max n_pan = max(40*6*16=3840, 16*16*16=4096)
+    ! Max scr_big = max(2*16*256 + 256 = 8448, 16*256 = 4096, 40*96 = 3840) -> 16384
+    allocate(np_buf(256, 5), p2_buf(256, 4), pan_buf(4096, 5))
+    allocate(cay_a(4096), cay_b(4096), cay_auto(4096), scr_big(16384))
+
+    do c_idx = 1_i32, n_cases
+      n  = ns(c_idx)
+      p  = ps(c_idx)
+      np = n * p
+      p2 = p * p
+      do k_idx = 1_i32, 3_i32
+        k_batch = k_list(k_idx)
+        n_pan   = np * k_batch
+        call verify_batch_transport_case(n, p, k_batch, &
+          np_buf(1:np, 1), np_buf(1:np, 2), np_buf(1:np, 3), np_buf(1:np, 4), np_buf(1:np, 5), &
+          p2_buf(1:p2, 1), p2_buf(1:p2, 2), p2_buf(1:p2, 3), p2_buf(1:p2, 4), &
+          pan_buf(1:n_pan, 1), pan_buf(1:n_pan, 2), pan_buf(1:n_pan, 3), &
+          pan_buf(1:n_pan, 4), pan_buf(1:n_pan, 5), &
+          cay_a, cay_b, cay_auto, scr_big)
+      end do
+    end do
+
+    deallocate(np_buf, p2_buf, pan_buf, cay_a, cay_b, cay_auto, scr_big)
+  end subroutine test_cayley_transport_batch_parity
 
 end program test_linalg_and_stiefel

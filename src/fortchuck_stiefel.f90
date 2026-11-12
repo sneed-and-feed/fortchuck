@@ -20,12 +20,15 @@ module fortchuck_stiefel
   public :: fc_cayley_setup
   public :: fc_cayley_retract
   public :: fc_cayley_transport_vec
+  public :: fc_cayley_transport_batch
   public :: fc_cayley_setup_branch_a
   public :: fc_cayley_retract_branch_a
   public :: fc_cayley_transport_branch_a
+  public :: fc_cayley_transport_batch_branch_a
   public :: fc_cayley_setup_branch_b
   public :: fc_cayley_retract_branch_b
   public :: fc_cayley_transport_branch_b
+  public :: fc_cayley_transport_batch_branch_b
 
 contains
 
@@ -642,6 +645,108 @@ contains
       scratch(4_i32 * p2 + 1_i32:5_i32 * p2))
   end subroutine fc_cayley_transport_branch_a
 
+  pure subroutine transport_batch_branch_a_p1(n, k_batch, X_old, tau, j11, eta_tilde_r, Panel)
+    integer(i32), intent(in) :: n, k_batch
+    real(dp), intent(in)     :: X_old(n, 1), tau, j11, eta_tilde_r(n, 1)
+    real(dp), intent(inout)  :: Panel(n, k_batch)
+
+    integer(i32) :: i, j
+    real(dp)     :: inv_j11, half_tau, r1_s, r2_s, z1_s, coeff_et, coeff_x
+
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    inv_j11  = 1.0_dp / j11
+    half_tau = 0.5_dp * tau
+    do j = 1_i32, k_batch
+      r1_s = 0.0_dp
+      r2_s = 0.0_dp
+      do i = 1_i32, n
+        r1_s = r1_s + X_old(i, 1) * Panel(i, j)
+        r2_s = r2_s - eta_tilde_r(i, 1) * Panel(i, j)
+      end do
+      z1_s     = (r1_s + half_tau * r2_s) * inv_j11
+      coeff_et = tau * z1_s
+      coeff_x  = 2.0_dp * (z1_s - r1_s)
+      do i = 1_i32, n
+        Panel(i, j) = Panel(i, j) + coeff_et * eta_tilde_r(i, 1) + coeff_x * X_old(i, 1)
+      end do
+    end do
+  end subroutine transport_batch_branch_a_p1
+
+  pure subroutine transport_batch_branch_a_arrays(n, p, ncol, X_old, tau, &
+      A_r, J_lu_r, eta_tilde_r, ipiv, Panel, R1, Z1, C_mat)
+    integer(i32), intent(in) :: n, p, ncol
+    real(dp), intent(in)     :: X_old(n, p), tau
+    real(dp), intent(in)     :: A_r(p, p), J_lu_r(p, p), eta_tilde_r(n, p)
+    integer(i32), intent(in) :: ipiv(p)
+    real(dp), intent(inout)  :: Panel(n, ncol), R1(p, ncol), Z1(p, ncol), C_mat(p, p)
+
+    integer(i32) :: i, j
+    real(dp)     :: q_tau
+
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    ! R1 = X_old^T * Panel, Z1 = -eta_tilde_r^T * Panel
+    call fc_gemm_tn(p, ncol, n,  1.0_dp, X_old,       n, Panel, n, 0.0_dp, R1, p)
+    call fc_gemm_tn(p, ncol, n, -1.0_dp, eta_tilde_r, n, Panel, n, 0.0_dp, Z1, p)
+
+    ! C_mat = I_p - (tau/4) * A_r
+    q_tau = 0.25_dp * tau
+    do j = 1_i32, p
+      do i = 1_i32, p
+        C_mat(i, j) = -q_tau * A_r(i, j)
+      end do
+      C_mat(j, j) = C_mat(j, j) + 1.0_dp
+    end do
+
+    ! Z1 := C_mat * R1 + (tau/2) * Z1, then solve J(tau) * Z1 = RHS via J(tau)^T LU
+    call fc_gemm_nn(p, ncol, p, 1.0_dp, C_mat, p, R1, p, 0.5_dp * tau, Z1, p)
+    call fc_lu_solve_trans(p, ncol, J_lu_r, ipiv, Z1)
+
+    ! R1 := C_mat * Z1 - R1
+    call fc_gemm_nn(p, ncol, p, 1.0_dp, C_mat, p, Z1, p, -1.0_dp, R1, p)
+
+    ! Panel := Panel + tau * eta_tilde_r * Z1 + 2 * X_old * R1
+    call fc_gemm_nn(n, ncol, p, tau,    eta_tilde_r, n, Z1, p, 1.0_dp, Panel, n)
+    call fc_gemm_nn(n, ncol, p, 2.0_dp, X_old,       n, R1, p, 1.0_dp, Panel, n)
+  end subroutine transport_batch_branch_a_arrays
+
+  pure subroutine fc_cayley_transport_batch_branch_a(n, p, k_batch, X_old, eta, tau, &
+      cay_buf, ipiv, Panel, scratch)
+    integer(i32), intent(in) :: n, p, k_batch
+    real(dp), intent(in)     :: X_old(n, p), eta(n, p), tau
+    real(dp), intent(in)     :: cay_buf(*)
+    integer(i32), intent(in) :: ipiv(p)
+    real(dp), intent(inout)  :: Panel(n, max(0_i32, p * k_batch)), scratch(*)
+
+    integer(i32) :: p2, np, ncol, p_ncol, i1, i3, i5
+
+    if (n <= 0_i32 .or. p <= 0_i32 .or. k_batch <= 0_i32) return
+    if (.false. .and. eta(1, 1) > 0.0_dp) continue
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    p2 = p * p
+    np = n * p
+    i1 = 1_i32
+    i3 = 1_i32 + 2_i32 * p2
+    i5 = 1_i32 + 3_i32 * p2 + np
+
+    if (p == 1_i32) then
+      call transport_batch_branch_a_p1(n, k_batch, X_old, tau, &
+        cay_buf(i3), cay_buf(i5:i5 + n - 1_i32), Panel)
+      return
+    end if
+
+    ncol   = p * k_batch
+    p_ncol = p * ncol
+    call transport_batch_branch_a_arrays(n, p, ncol, X_old, tau, &
+      cay_buf(i1:i1 + p2 - 1_i32), cay_buf(i3:i3 + p2 - 1_i32), cay_buf(i5:i5 + np - 1_i32), &
+      ipiv, Panel, &
+      scratch(1_i32:p_ncol), &
+      scratch(p_ncol + 1_i32:2_i32 * p_ncol), &
+      scratch(2_i32 * p_ncol + 1_i32:2_i32 * p_ncol + p2))
+  end subroutine fc_cayley_transport_batch_branch_a
+
   !===========================================================================
   ! Branch B: Direct n x n Skew-Cayley LU with Resolvent Doubling 2*M^{-1} - I
   ! Persistent cay_buf layout (2*n^2 doubles):
@@ -834,6 +939,51 @@ contains
       cay_buf(n2 + 1_i32:2_i32 * n2), ipiv, zeta_inout, scratch(1_i32:np))
   end subroutine fc_cayley_transport_branch_b
 
+  pure subroutine transport_batch_branch_b_arrays(n, ncol, tau, M_lu, ipiv, Panel, Z_scr)
+    integer(i32), intent(in) :: n, ncol
+    real(dp), intent(in)     :: tau, M_lu(n, n)
+    integer(i32), intent(in) :: ipiv(n)
+    real(dp), intent(inout)  :: Panel(n, ncol), Z_scr(n, ncol)
+
+    integer(i32) :: i, j
+
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    do j = 1_i32, ncol
+      do i = 1_i32, n
+        Z_scr(i, j) = 2.0_dp * Panel(i, j)
+      end do
+    end do
+    call fc_lu_solve(n, ncol, M_lu, ipiv, Z_scr)
+
+    do j = 1_i32, ncol
+      do i = 1_i32, n
+        Panel(i, j) = Z_scr(i, j) - Panel(i, j)
+      end do
+    end do
+  end subroutine transport_batch_branch_b_arrays
+
+  pure subroutine fc_cayley_transport_batch_branch_b(n, p, k_batch, X_old, eta, tau, &
+      cay_buf, ipiv, Panel, scratch)
+    integer(i32), intent(in) :: n, p, k_batch
+    real(dp), intent(in)     :: X_old(n, p), eta(n, p), tau
+    real(dp), intent(in)     :: cay_buf(*)
+    integer(i32), intent(in) :: ipiv(n)
+    real(dp), intent(inout)  :: Panel(n, max(0_i32, p * k_batch)), scratch(*)
+
+    integer(i32) :: n2, ncol, n_ncol
+
+    if (n <= 0_i32 .or. p <= 0_i32 .or. k_batch <= 0_i32) return
+    if (.false. .and. X_old(1, 1) > 0.0_dp .and. eta(1, 1) > 0.0_dp) continue
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    n2     = n * n
+    ncol   = p * k_batch
+    n_ncol = n * ncol
+    call transport_batch_branch_b_arrays(n, ncol, tau, &
+      cay_buf(n2 + 1_i32:2_i32 * n2), ipiv, Panel, scratch(1_i32:n_ncol))
+  end subroutine fc_cayley_transport_batch_branch_b
+
   !===========================================================================
   ! Auto-Dispatching Dual-Regime Public Entry Points
   !   2 * p <  n -> Branch A (Schur-Woodbury + p == 1 fast-path)
@@ -883,5 +1033,25 @@ contains
         cay_buf, ipiv(1_i32:n), zeta_inout, scratch)
     end if
   end subroutine fc_cayley_transport_vec
+
+  pure subroutine fc_cayley_transport_batch(n, p, k_batch, X_old, eta, tau, &
+      cay_buf, ipiv, Panel, scratch)
+    integer(i32), intent(in) :: n, p, k_batch
+    real(dp), intent(in)     :: X_old(n, p), eta(n, p), tau
+    real(dp), intent(in)     :: cay_buf(*)
+    integer(i32), intent(in) :: ipiv(*)
+    real(dp), intent(inout)  :: Panel(n, max(0_i32, p * k_batch)), scratch(*)
+
+    if (n <= 0_i32 .or. p <= 0_i32 .or. k_batch <= 0_i32) return
+    if (.not. (abs(tau) > 0.0_dp)) return
+
+    if (2_i32 * p < n) then
+      call fc_cayley_transport_batch_branch_a(n, p, k_batch, X_old, eta, tau, &
+        cay_buf, ipiv(1_i32:p), Panel, scratch)
+    else
+      call fc_cayley_transport_batch_branch_b(n, p, k_batch, X_old, eta, tau, &
+        cay_buf, ipiv(1_i32:n), Panel, scratch)
+    end if
+  end subroutine fc_cayley_transport_batch
 
 end module fortchuck_stiefel

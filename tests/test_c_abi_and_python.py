@@ -20,6 +20,7 @@ from fortchuck import (
     FC_DAMP_POWELL,
     FC_ERR_CALLBACK_ABORT,
     FC_ERR_CALLBACK_NAN,
+    FC_ERR_INFEASIBLE_LIN,
     FC_ERR_INVALID_BOUNDS,
     FC_ERR_INVALID_DIM,
     FC_ERR_INVALID_OPTS,
@@ -40,6 +41,7 @@ from fortchuck import (
     kkt_residual,
     load_native_library,
     minimize_box_stiefel,
+    project_linear_box,
     project_stiefel,
     workspace_query,
 )
@@ -52,7 +54,7 @@ C_F64_P = ctypes.POINTER(ctypes.c_double)
 def _exact_spec_workspace_sizes(
     d: int, n_list: list[int], p_list: list[int], m: int
 ) -> tuple[int, int]:
-    """Reference formula from `ARCHITECTURE_SPEC.md` §3.4."""
+    """Reference unified v0.2.0 formula from `ARCHITECTURE_SPEC.md` §3.4."""
     R = len(n_list)
     d_pad = max(d, 1)
     n_st = sum(n * p for n, p in zip(n_list, p_list))
@@ -60,27 +62,31 @@ def _exact_spec_workspace_sizes(
     n_tot_pad = max(d + n_st, 1)
     n_skew_pad = max(1, sum(p * p for p in p_list))
     m_pad = max(m, 1)
+    k_max = 2 * m + 2
 
     c_sum = 0
     q_sum = 0
     scr_max = 64
     for n, p in zip(n_list, p_list):
+        scr_base = 2 * n * p + 6 * p * p + 4 * p
         if 2 * p < n:
             c_sum += 2 * n * p + 3 * p * p
             q_sum += p
+            scr_batch = (n + 2 * p) * p * k_max + p * p
         else:
             c_sum += 2 * n * n
             q_sum += n
-        scr_max = max(scr_max, 2 * n * p + 6 * p * p + 4 * p)
+            scr_batch = 2 * n * p * k_max
+        scr_max = max(scr_max, scr_base, scr_batch)
 
     n_cay = max(1, c_sum)
     n_piv = max(1, q_sum)
     n_scr = scr_max
 
     lwork = (
-        5 * d_pad
+        7 * d_pad
         + 6 * n_st_pad
-        + 3 * n_tot_pad
+        + 4 * n_tot_pad
         + n_skew_pad
         + 4 * (R + 1)
         + 2 * m * n_tot_pad
@@ -94,6 +100,9 @@ def _exact_spec_workspace_sizes(
 
 
 def test_struct_binary_layout_and_default_options_parity() -> None:
+    assert fc.__version__ == "0.2.0"
+    assert FC_ERR_INFEASIBLE_LIN == -10
+    assert fc.STATUS_NAMES[FC_ERR_INFEASIBLE_LIN] == "FC_ERR_INFEASIBLE_LIN"
     assert ctypes.sizeof(FCOptions) == 96
     assert ctypes.sizeof(FCResult) == 88
     assert fc.is_native_available() is True
@@ -199,6 +208,66 @@ def test_workspace_query_and_lwork_minus_one_parity(
     assert st2 == FC_SUCCESS_QUERY
     assert res2.lwork_min == lw_q
     assert res2.liwork_min == liw_q
+
+    # Parity with fortchuck_solve_constrained (requires d >= 1; returns FC_ERR_INVALID_DIM on d == 0)
+    work_probe_c = np.zeros(1, dtype=np.float64)
+    iwork_probe_c = np.zeros(1, dtype=np.int32)
+    res_c = FCResult()
+    st_c = lib.fortchuck_solve_constrained(
+        d,
+        R,
+        n_ptr,
+        p_ptr,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        FCEvalCallback(0),
+        None,
+        ctypes.byref(opts),
+        work_probe_c.ctypes.data_as(C_F64_P),
+        -1,
+        iwork_probe_c.ctypes.data_as(C_I32_P),
+        -1,
+        ctypes.byref(res_c),
+    )
+    if d >= 1:
+        assert st_c == FC_SUCCESS_QUERY
+        assert res_c.status == FC_SUCCESS_QUERY
+        assert int(work_probe_c[0]) == lw_q
+        assert int(iwork_probe_c[0]) == liw_q
+        assert res_c.lwork_min == lw_q
+        assert res_c.liwork_min == liw_q
+
+        res_c2 = FCResult()
+        st_c2 = lib.fortchuck_solve_constrained(
+            d,
+            R,
+            n_ptr,
+            p_ptr,
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            None,
+            FCEvalCallback(0),
+            None,
+            ctypes.byref(opts),
+            None,
+            lw_q,
+            None,
+            -1,
+            ctypes.byref(res_c2),
+        )
+        assert st_c2 == FC_SUCCESS_QUERY
+        assert res_c2.lwork_min == lw_q
+        assert res_c2.liwork_min == liw_q
+    else:
+        assert st_c == FC_ERR_INVALID_DIM
+        assert res_c.status == FC_ERR_INVALID_DIM
 
 
 def test_zero_copy_fortran_order_views_and_reusable_workspace() -> None:
@@ -849,3 +918,536 @@ def test_project_stiefel_and_kkt_residual_c_abi_helpers() -> None:
         assert orth_val == pytest.approx(
             float(np.linalg.norm(X1.T @ X1 - np.eye(3), ord="fro")), abs=1e-15
         )
+
+
+def test_project_linear_box_and_kkt_residual_constrained() -> None:
+    lib = load_native_library()
+    rng = np.random.default_rng(202602)
+
+    # 1. Unit simplex & capped simplex projection + variational optimality certificate
+    d = 8
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.full(d, 0.35, dtype=np.float64)
+    a_ones = np.ones(d, dtype=np.float64)
+    b_cap = 1.25
+
+    y = rng.standard_normal(d)
+    y_snap = y.copy()
+    z_proj, nu = project_linear_box(y, lower, upper, a_ones, b_cap)
+    # Default copy=True leaves input untouched
+    assert np.array_equal(y, y_snap)
+    assert z_proj is not y
+    assert np.all(z_proj >= lower - 1.0e-16) and np.all(z_proj <= upper + 1.0e-16)
+    assert abs(float(np.dot(a_ones, z_proj)) - b_cap) <= 1.0e-14
+    assert np.allclose(z_proj, np.clip(y - nu * a_ones, lower, upper), atol=1.0e-14, rtol=0.0)
+
+    # Variational inequality <y - z_proj, w - z_proj> <= 0 across random feasible w in C
+    for _ in range(25):
+        w_raw = rng.uniform(-2.0, 2.0, size=d)
+        w_feas, _ = project_linear_box(w_raw, lower, upper, a_ones, b_cap)
+        assert float(np.dot(y - z_proj, w_feas - z_proj)) <= 1.0e-14
+
+    # Zero-copy in-place fast path when copy=False on writeable float64 1D ndarray
+    y_inplace = y.copy()
+    ptr_before = y_inplace.ctypes.data
+    z_in, nu_in = project_linear_box(y_inplace, lower, upper, a_ones, b_cap, copy=False)
+    assert z_in is y_inplace
+    assert z_in.ctypes.data == ptr_before
+    assert np.array_equal(z_in, z_proj)
+    assert nu_in == pytest.approx(nu, rel=0.0, abs=1.0e-16)
+
+    # 2. General signed weights, +-inf / +-DBL_MAX bounds, singleton faces, and raw C-ABI NULL nu_out
+    dbl_max = float(np.finfo(np.float64).max)
+    l_gen = np.array([-np.inf, -dbl_max, 0.0, -1.5, 0.4, 0.0], dtype=np.float64)
+    u_gen = np.array([1.0, dbl_max, np.inf, 2.0, 0.4, 3.0], dtype=np.float64)
+    a_gen = np.array([1.2, -0.75, 0.5, -1.4, 2.0, 0.8], dtype=np.float64)
+    b_gen = 1.65
+    y_gen = np.array([2.5, -1.0, -0.8, 1.2, 9.0, 0.3], dtype=np.float64)
+    zp_gen, nu_gen = project_linear_box(y_gen, l_gen, u_gen, a_gen, b_gen)
+    assert zp_gen[4] == pytest.approx(0.4, abs=1.0e-16)
+    assert abs(float(np.dot(a_gen, zp_gen)) - b_gen) <= 1.0e-14
+    assert np.allclose(zp_gen, np.clip(y_gen - nu_gen * a_gen, l_gen, u_gen), atol=1.0e-13, rtol=0.0)
+
+    # Raw C-ABI call with nu_out == NULL and singleton boundary faces (b == b_min, b == b_max)
+    z_c = y.copy()
+    st_null_nu = lib.fortchuck_project_linear_box(
+        d,
+        lower.ctypes.data_as(C_F64_P),
+        upper.ctypes.data_as(C_F64_P),
+        a_ones.ctypes.data_as(C_F64_P),
+        b_cap,
+        z_c.ctypes.data_as(C_F64_P),
+        None,
+    )
+    assert st_null_nu == FC_SUCCESS_QUERY
+    assert np.allclose(z_c, z_proj, atol=1.0e-15, rtol=0.0)
+
+    z_bmin, _ = project_linear_box(y, lower, upper, a_ones, 0.0)
+    assert np.allclose(z_bmin, lower, atol=1.0e-15, rtol=0.0)
+    z_bmax, _ = project_linear_box(y, lower, upper, a_ones, float(np.sum(upper)))
+    assert np.allclose(z_bmax, upper, atol=1.0e-15, rtol=0.0)
+
+    # 3. fortchuck_kkt_residual_constrained lwork = -1 query & Python kkt_residual(..., linear_constraint=...)
+    w_q = np.zeros(1, dtype=np.float64)
+    st_q0 = lib.fortchuck_kkt_residual_constrained(
+        d, 0, None, None, None, None, None, None, b_cap, None, None, None,
+        FC_METRIC_CANONICAL, w_q.ctypes.data_as(C_F64_P), -1, None, None, None,
+    )
+    assert st_q0 == FC_SUCCESS_QUERY and int(w_q[0]) == d
+
+    n_arr = np.array([10, 4], dtype=np.int32)
+    p_arr = np.array([2, 4], dtype=np.int32)
+    st_q2 = lib.fortchuck_kkt_residual_constrained(
+        d, 2, n_arr.ctypes.data_as(C_I32_P), p_arr.ctypes.data_as(C_I32_P),
+        None, None, None, None, b_cap, None, None, None,
+        FC_METRIC_CANONICAL, w_q.ctypes.data_as(C_F64_P), -1, None, None, None,
+    )
+    exp_lw_kkt = max(1, d + max(10 * 2 + 3 * 4, 4 * 4 + 3 * 16))
+    assert st_q2 == FC_SUCCESS_QUERY and int(w_q[0]) == exp_lw_kkt
+
+    gz_test = rng.standard_normal(d)
+    X1 = project_stiefel(rng.standard_normal((10, 2)))
+    X2 = project_stiefel(rng.standard_normal((4, 4)))
+    GX1 = rng.standard_normal((10, 2))
+    GX2 = rng.standard_normal((4, 4))
+
+    for metric in (FC_METRIC_CANONICAL, FC_METRIC_EUCLIDEAN):
+        res_tuple = kkt_residual(
+            z=z_proj,
+            bounds=(lower, upper),
+            X_list=[X1, X2],
+            gz=gz_test,
+            GX_list=[GX1, GX2],
+            linear_constraint=(a_ones, b_cap),
+            metric=metric,
+        )
+        assert len(res_tuple) == 3
+        kkt_val, lin_val, orth_val = res_tuple
+
+        z_step_proj, _ = project_linear_box(z_proj - gz_test, lower, upper, a_ones, b_cap)
+        box_inf_ref = float(np.max(np.abs(z_proj - z_step_proj)))
+        st_norms: list[float] = []
+        for X_r, GX_r in ((X1, GX1), (X2, GX2)):
+            if metric == FC_METRIC_CANONICAL:
+                rg = GX_r - X_r @ (GX_r.T @ X_r)
+                xt_rg = X_r.T @ rg
+                st_norms.append(math.sqrt(float(np.sum(rg * rg) - 0.5 * np.sum(xt_rg * xt_rg))))
+            else:
+                sym = 0.5 * (X_r.T @ GX_r + GX_r.T @ X_r)
+                rg = GX_r - X_r @ sym
+                st_norms.append(float(np.linalg.norm(rg, ord="fro")))
+        exp_orth = max(
+            float(np.linalg.norm(X1.T @ X1 - np.eye(2), ord="fro")),
+            float(np.linalg.norm(X2.T @ X2 - np.eye(4), ord="fro")),
+        )
+        assert kkt_val == pytest.approx(max(box_inf_ref, *st_norms), rel=1e-14, abs=1e-15)
+        assert lin_val == pytest.approx(abs(float(np.dot(a_ones, z_proj)) - b_cap), abs=1e-15)
+        assert orth_val == pytest.approx(exp_orth, abs=1e-15)
+
+
+def test_infeasible_linear_constraint_and_validation_errors() -> None:
+    lib = load_native_library()
+    d = 4
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.ones(d, dtype=np.float64)
+    a_ok = np.array([1.0, 2.0, 0.5, 1.5], dtype=np.float64)  # b_min = 0.0, b_max = 5.0
+    z0 = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+    X0 = np.asfortranarray(np.eye(5, 2, dtype=np.float64))
+
+    def simple_fg(
+        z: np.ndarray, xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X = xs[0] if xs else None
+        f_v = 0.5 * float(np.sum((z - 0.3) ** 2))
+        gx_list: list[np.ndarray] = []
+        if X is not None:
+            f_v += 0.5 * float(np.sum(X * X))
+            gx_list.append(X.copy(order="F"))
+        return f_v, z - 0.3, gx_list
+
+    # 1. Raw C-ABI FC_ERR_INFEASIBLE_LIN (-10) across project_linear_box, kkt_residual_constrained, solve_constrained
+    z_tmp = z0.copy()
+    gz_tmp = np.ones(d, dtype=np.float64)
+    w_tmp = np.zeros(128, dtype=np.float64)
+    iw_tmp = np.zeros(64, dtype=np.int32)
+    kkt_o = ctypes.c_double(0.0)
+    lin_o = ctypes.c_double(0.0)
+    orth_o = ctypes.c_double(0.0)
+    opts = FCOptions()
+    res_c = FCResult()
+    lw_min, liw_min = workspace_query(d=d, n_list=[], p_list=[], memory=opts.memory)
+    work_s = np.zeros(lw_min, dtype=np.float64)
+    iwork_s = np.zeros(liw_min, dtype=np.int32)
+
+    @FCEvalCallback
+    def dummy_cb(
+        _d: int, _r: int, _np: object, _pp: object, _zp: object, _xp: object,
+        f_p: object, _gzp: object, _gxp: object, _u: object
+    ) -> int:
+        f_p[0] = 0.0  # type: ignore[index]
+        return 0
+
+    a_zero = np.zeros(d, dtype=np.float64)
+    a_nan = np.array([1.0, np.nan, 0.5, 1.5], dtype=np.float64)
+    a_inf = np.array([1.0, np.inf, 0.5, 1.5], dtype=np.float64)
+
+    for bad_a, bad_b in [
+        (a_ok, 5.5),       # b > b_max
+        (a_ok, -0.25),     # b < b_min
+        (a_zero, 0.0),     # ||a||_inf == 0
+        (a_nan, 1.0),      # NaN in a
+        (a_inf, 1.0),      # Inf in a
+        (a_ok, np.nan),    # NaN in b
+        (a_ok, np.inf),    # Inf in b
+    ]:
+        assert (
+            lib.fortchuck_project_linear_box(
+                d,
+                lower.ctypes.data_as(C_F64_P),
+                upper.ctypes.data_as(C_F64_P),
+                bad_a.ctypes.data_as(C_F64_P),
+                float(bad_b),
+                z_tmp.ctypes.data_as(C_F64_P),
+                None,
+            )
+            == FC_ERR_INFEASIBLE_LIN
+        )
+        assert (
+            lib.fortchuck_kkt_residual_constrained(
+                d, 0, None, None,
+                z_tmp.ctypes.data_as(C_F64_P),
+                lower.ctypes.data_as(C_F64_P),
+                upper.ctypes.data_as(C_F64_P),
+                bad_a.ctypes.data_as(C_F64_P),
+                float(bad_b),
+                None,
+                gz_tmp.ctypes.data_as(C_F64_P),
+                None,
+                FC_METRIC_CANONICAL,
+                w_tmp.ctypes.data_as(C_F64_P),
+                w_tmp.size,
+                ctypes.byref(kkt_o),
+                ctypes.byref(lin_o),
+                ctypes.byref(orth_o),
+            )
+            == FC_ERR_INFEASIBLE_LIN
+        )
+        assert (
+            lib.fortchuck_solve_constrained(
+                d, 0, None, None,
+                z_tmp.ctypes.data_as(C_F64_P),
+                lower.ctypes.data_as(C_F64_P),
+                upper.ctypes.data_as(C_F64_P),
+                bad_a.ctypes.data_as(C_F64_P),
+                float(bad_b),
+                None,
+                dummy_cb,
+                None,
+                ctypes.byref(opts),
+                work_s.ctypes.data_as(C_F64_P),
+                work_s.size,
+                iwork_s.ctypes.data_as(C_I32_P),
+                iwork_s.size,
+                ctypes.byref(res_c),
+            )
+            == FC_ERR_INFEASIBLE_LIN
+        )
+        assert res_c.status == FC_ERR_INFEASIBLE_LIN
+
+        # Python solver returns OptimizeResult with status == FC_ERR_INFEASIBLE_LIN
+        r_py = minimize_box_stiefel(
+            simple_fg,
+            z0=z0,
+            bounds=(lower, upper),
+            X0_list=X0,
+            linear_constraint=(bad_a, float(bad_b)),
+            copy=True,
+        )
+        assert r_py.status == FC_ERR_INFEASIBLE_LIN
+        assert r_py.status_name == "FC_ERR_INFEASIBLE_LIN"
+        assert r_py.converged is False
+
+        # Python helpers raise ValueError mentioning FC_ERR_INFEASIBLE_LIN
+        with pytest.raises(ValueError, match="FC_ERR_INFEASIBLE_LIN"):
+            project_linear_box(z0, lower, upper, bad_a, float(bad_b))
+        with pytest.raises(ValueError, match="FC_ERR_INFEASIBLE_LIN"):
+            kkt_residual(
+                z=z0, bounds=(lower, upper), gz=gz_tmp, linear_constraint=(bad_a, float(bad_b))
+            )
+
+    # 2. Additional C-ABI & Python constrained guard codes (NULL, d=0, project_initial=0)
+    assert (
+        lib.fortchuck_project_linear_box(
+            0, lower.ctypes.data_as(C_F64_P), upper.ctypes.data_as(C_F64_P),
+            a_ok.ctypes.data_as(C_F64_P), 1.0, z_tmp.ctypes.data_as(C_F64_P), None,
+        )
+        == FC_ERR_INVALID_DIM
+    )
+    assert (
+        lib.fortchuck_project_linear_box(
+            d, None, upper.ctypes.data_as(C_F64_P),
+            a_ok.ctypes.data_as(C_F64_P), 1.0, z_tmp.ctypes.data_as(C_F64_P), None,
+        )
+        == FC_ERR_NULL_PTR
+    )
+    assert (
+        lib.fortchuck_solve_constrained(
+            d, 0, None, None,
+            z_tmp.ctypes.data_as(C_F64_P),
+            lower.ctypes.data_as(C_F64_P),
+            upper.ctypes.data_as(C_F64_P),
+            None,
+            1.0,
+            None,
+            dummy_cb,
+            None,
+            ctypes.byref(opts),
+            work_s.ctypes.data_as(C_F64_P),
+            work_s.size,
+            iwork_s.ctypes.data_as(C_I32_P),
+            iwork_s.size,
+            ctypes.byref(res_c),
+        )
+        == FC_ERR_NULL_PTR
+    )
+    _ = iw_tmp
+
+    # project_initial = 0 with a^T z0 != b -> FC_ERR_INVALID_X0
+    r_unproj = minimize_box_stiefel(
+        simple_fg,
+        z0=z0,  # a_ok^T z0 = 1.25 != 2.5
+        bounds=(lower, upper),
+        X0_list=X0,
+        options={"project_initial": 0},
+        linear_constraint=(a_ok, 2.5),
+        copy=True,
+    )
+    assert r_unproj.status == FC_ERR_INVALID_X0
+
+    # Python structural argument validation
+    with pytest.raises(ValueError, match="d >= 1"):
+        minimize_box_stiefel(simple_fg, X0_list=X0, linear_constraint=(a_ok, 1.0), copy=True)
+    with pytest.raises(ValueError, match="1D float64 array"):
+        minimize_box_stiefel(
+            simple_fg, z0=z0, bounds=(lower, upper), linear_constraint=(a_ok[:2], 1.0), copy=True
+        )
+    with pytest.raises(ValueError, match="1D float64 array"):
+        minimize_box_stiefel(
+            simple_fg,
+            z0=z0,
+            bounds=(lower, upper),
+            linear_constraint=(a_ok.reshape(2, 2), 1.0),
+            copy=True,
+        )
+    with pytest.raises(ValueError, match="2-tuple"):
+        minimize_box_stiefel(
+            simple_fg, z0=z0, bounds=(lower, upper), linear_constraint=(a_ok,), copy=True  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="real scalar"):
+        minimize_box_stiefel(
+            simple_fg,
+            z0=z0,
+            bounds=(lower, upper),
+            linear_constraint=(a_ok, np.array([1.0, 2.0])),  # type: ignore[arg-type]
+            copy=True,
+        )
+
+
+def test_minimize_box_stiefel_linear_constraint_regimes() -> None:
+    rng = np.random.default_rng(202603)
+
+    # 1. Pure Simplex / Capped Knapsack (R = 0) with reusable FortchuckWorkspace
+    d0 = 12
+    l0 = np.zeros(d0, dtype=np.float64)
+    u0 = np.full(d0, 0.4, dtype=np.float64)
+    a0 = np.linspace(0.6, 1.7, d0, dtype=np.float64)
+    b0 = 2.0
+    w0 = np.linspace(1.5, 8.0, d0, dtype=np.float64)
+    targ0 = np.array([-0.5, 0.9, 0.25, -0.3, 0.8, 0.15, 0.6, -0.2, 0.35, 0.1, 0.7, -0.4])
+    z0_init = np.full(d0, 0.1, dtype=np.float64)  # Infeasible sum -> projected at k=0
+
+    def fg_knapsack(
+        z: np.ndarray, _xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        diff = z - targ0
+        return 0.5 * float(np.sum(w0 * diff * diff)), w0 * diff, []
+
+    ws0 = FortchuckWorkspace(d=d0, n_list=[], p_list=[], memory=7)
+    res0 = minimize_box_stiefel(
+        fg_knapsack,
+        z0=z0_init,
+        bounds=(l0, u0),
+        options={"gtol": 1.0e-11},
+        linear_constraint=(a0, b0),
+        workspace=ws0,
+        copy=True,
+    )
+    assert res0.status == FC_CONVERGED_GRAD
+    assert res0.kkt_residual <= 1.0e-11
+    assert abs(float(np.dot(a0, res0.z)) - b0) <= 1.0e-14
+    assert np.any(res0.z == 0.0) and np.any(np.isclose(res0.z, 0.4, atol=1e-14))
+    _, gz0_fin, _ = fg_knapsack(res0.z, [])
+    kkt0, lin0, orth0 = kkt_residual(
+        z=res0.z, bounds=(l0, u0), gz=gz0_fin, linear_constraint=(a0, b0)
+    )
+    assert kkt0 == pytest.approx(res0.kkt_residual, abs=1.0e-14)
+    assert lin0 <= 1.0e-14 and orth0 == 0.0
+
+    # 2. Coupled Trace Constraint a = 1 (R = 1) + Zero-Copy order='F' + Mode Coverage
+    d1, n1, p1 = 6, 12, 3
+    l1 = np.zeros(d1, dtype=np.float64)
+    u1 = np.ones(d1, dtype=np.float64)
+    a1 = np.ones(d1, dtype=np.float64)
+    b1 = 2.5
+    d_st1 = np.linspace(1.0, 6.0, n1, dtype=np.float64)
+    targ1 = np.array([-0.2, 0.85, 0.55, 1.3, 0.35, -0.4], dtype=np.float64)
+
+    z1_zc = np.array([0.5, 0.4, 0.4, 0.5, 0.4, 0.3], dtype=np.float64)
+    X1_zc = project_stiefel(np.asfortranarray(rng.standard_normal((n1, p1))))
+    z1_ptr = z1_zc.ctypes.data
+    X1_ptr = X1_zc.ctypes.data
+
+    def fg_trace_inplace(
+        z: np.ndarray,
+        xs: list[np.ndarray],
+        gz_out: np.ndarray,
+        gx_out_list: list[np.ndarray],
+    ) -> float:
+        X = xs[0]
+        GX_out = gx_out_list[0]
+        diff = z - targ1
+        f_box = 0.5 * float(np.sum(3.0 * diff * diff))
+        gz_out[:] = 3.0 * diff
+
+        DX = d_st1[:, None] * X
+        col_quad = np.sum(X * DX, axis=0)
+        weights = 0.5 + z[:p1]
+        f_st = 0.5 * float(np.dot(weights, col_quad))
+        gz_out[:p1] += 0.5 * col_quad
+        GX_out[:] = DX * weights[None, :]
+        return f_box + f_st
+
+    ws1 = FortchuckWorkspace(d=d1, n_list=[n1], p_list=[p1], memory=7)
+    res1_zc = minimize_box_stiefel(
+        fg_trace_inplace,
+        z0=z1_zc,
+        bounds=(l1, u1),
+        X0_list=X1_zc,
+        options={"gtol": 1.0e-10},
+        linear_constraint=(a1, b1),
+        workspace=ws1,
+        copy=False,
+        in_place_grad=True,
+    )
+    assert res1_zc.status == FC_CONVERGED_GRAD
+    assert res1_zc.z is z1_zc and res1_zc.z.ctypes.data == z1_ptr
+    assert res1_zc.X_list[0] is X1_zc and res1_zc.X_list[0].ctypes.data == X1_ptr
+    assert res1_zc.kkt_residual <= 1.0e-10
+    assert abs(float(np.sum(res1_zc.z)) - b1) <= 1.0e-14
+    assert res1_zc.orth_error <= 1.0e-13
+
+    for metric, damp, mem in [
+        (FC_METRIC_CANONICAL, FC_DAMP_CAUTIOUS, 7),
+        (FC_METRIC_CANONICAL, FC_DAMP_POWELL, 7),
+        (FC_METRIC_EUCLIDEAN, FC_DAMP_CAUTIOUS, 7),
+        (FC_METRIC_CANONICAL, FC_DAMP_CAUTIOUS, 0),
+    ]:
+        r_mode = minimize_box_stiefel(
+            fg_trace_inplace,
+            z0=np.full(d1, b1 / d1, dtype=np.float64),
+            bounds=(l1, u1),
+            X0_list=X1_zc,
+            options=FCOptions(gtol=1.0e-9, metric=metric, damping_mode=damp, memory=mem),
+            linear_constraint=(a1, b1),
+            copy=True,
+            in_place_grad=True,
+        )
+        assert r_mode.status == FC_CONVERGED_GRAD
+        assert r_mode.kkt_residual <= 1.0e-9
+        assert abs(float(np.sum(r_mode.z)) - b1) <= 1.0e-14
+
+    # 3. Coupled General Signed Weights a != 1 (R = 2: St(10, 2) x SO(4)) + Shift Invariance
+    d2 = 8
+    n_list2 = [10, 4]
+    p_list2 = [2, 4]
+    l2 = np.array([0.0, 0.0, 0.35, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    u2 = np.array([1.0, 1.0, 0.35, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+    a2 = np.array([1.4, 0.9, 1.2, -0.8, 1.7, -0.5, 1.1, 0.6], dtype=np.float64)
+    b2 = 2.15
+    targ2 = np.array([-0.4, 1.6, 0.35, 0.55, 0.75, -0.8, 0.45, 1.3], dtype=np.float64)
+    w_box2 = np.arange(3.5, 3.5 + d2, dtype=np.float64)
+    d_st2a = np.linspace(1.0, 4.5, 10, dtype=np.float64)
+    d_st2b = np.linspace(0.5, 2.0, 4, dtype=np.float64)
+
+    z2_0 = rng.uniform(0.1, 0.9, size=d2)
+    X2a_0 = project_stiefel(np.asfortranarray(rng.standard_normal((10, 2))))
+    X2b_0 = project_stiefel(np.asfortranarray(rng.standard_normal((4, 4))))
+    if np.linalg.det(X2b_0) < 0.0:
+        X2b_0[:, 0] *= -1.0
+
+    def make_fg_multi(shift_mu: float):
+        def _fg(
+            z: np.ndarray, xs: list[np.ndarray]
+        ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+            X_a, X_b = xs[0], xs[1]
+            dz = z - targ2
+            f_v = 0.5 * float(np.sum(w_box2 * dz * dz)) + shift_mu * float(np.dot(a2, z))
+            gz = w_box2 * dz + shift_mu * a2
+
+            DXa = d_st2a[:, None] * X_a
+            qa = np.sum(X_a * DXa, axis=0)
+            f_v += 0.5 * float(np.dot(0.5 + z[:2], qa))
+            gz[:2] += 0.5 * qa
+            GXa = DXa * (0.5 + z[:2])[None, :]
+
+            Db = X_b - np.eye(4, dtype=np.float64)
+            WDb = d_st2b[:, None] * Db
+            qb = np.sum(Db * WDb, axis=0)
+            f_v += 0.5 * float(np.dot(0.8 + 0.5 * z[4:8], qb))
+            gz[4:8] += 0.25 * qb
+            GXb = WDb * (0.8 + 0.5 * z[4:8])[None, :]
+
+            # Cross-factor trilinear coupling
+            tr_a = float(X_a[0, 0] + X_a[1, 1])
+            tr_b = float(np.trace(X_b))
+            f_v += 0.2 * float(z[5]) * tr_a * tr_b
+            gz[5] += 0.2 * tr_a * tr_b
+            GXa[0, 0] += 0.2 * float(z[5]) * tr_b
+            GXa[1, 1] += 0.2 * float(z[5]) * tr_b
+            for j in range(4):
+                GXb[j, j] += 0.2 * float(z[5]) * tr_a
+            return f_v, gz, [GXa, GXb]
+
+        return _fg
+
+    ws2 = FortchuckWorkspace(d=d2, n_list=n_list2, p_list=p_list2, memory=7)
+    res2_base = minimize_box_stiefel(
+        make_fg_multi(0.0),
+        z0=z2_0,
+        bounds=(l2, u2),
+        X0_list=[X2a_0, X2b_0],
+        options={"gtol": 1.0e-9},
+        linear_constraint=(a2, b2),
+        workspace=ws2,
+        copy=True,
+    )
+    assert res2_base.status == FC_CONVERGED_GRAD
+    assert res2_base.kkt_residual <= 1.0e-9
+    assert abs(float(np.dot(a2, res2_base.z)) - b2) <= 1.0e-14
+    assert res2_base.z[2] == pytest.approx(0.35, abs=1.0e-16)
+    assert np.linalg.det(res2_base.X_list[1]) == pytest.approx(1.0, abs=1.0e-13)
+
+    # Verify Rank-1 KKT Nullspace Two-Loop multiplier shift invariance: gz -> gz + 1e4 * a2
+    res2_shift = minimize_box_stiefel(
+        make_fg_multi(1.0e4),
+        z0=z2_0,
+        bounds=(l2, u2),
+        X0_list=[X2a_0, X2b_0],
+        options={"gtol": 1.0e-9},
+        linear_constraint=(a2, b2),
+        workspace=ws2,
+        copy=True,
+    )
+    assert res2_shift.status == FC_CONVERGED_GRAD
+    assert np.allclose(res2_shift.z, res2_base.z, atol=1.0e-8, rtol=0.0)
+    assert abs((res2_shift.f_val - 1.0e4 * b2) - res2_base.f_val) <= 1.0e-9

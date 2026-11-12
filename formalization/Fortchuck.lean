@@ -10,11 +10,11 @@ import Mathlib.Tactic.NoncommRing
 import Mathlib.Tactic.Positivity
 
 /-!
-# `Fortchuck`: Machine-Checked Algebraic & Variational Invariants
+# `Fortchuck`: Machine-Checked Algebraic & Variational Invariants (`v0.2.0`)
 
-This module provides complete, self-contained Lean 4 (`0 sorry`, `0` custom axioms, `0` warnings)
-proofs of the four foundational mathematical theorems underlying **`fortchuck`**
-(`docs/ARCHITECTURE_SPEC.md` §2.2–§2.5 and §5.3):
+This module provides complete, self-contained, fully closed, zero-warning Lean 4
+proofs of the seven foundational mathematical theorems underlying **`fortchuck`**
+(`docs/ARCHITECTURE_SPEC.md` §2.2–§2.9 and §5.3):
 
 1. **Theorem 1 (`skew_generator_properties`)**:
    For $X \in \mathrm{St}(n, p)$ ($X^\top X = I_p$) and Stiefel tangent $\xi \in T_X \mathrm{St}(n, p)$
@@ -28,14 +28,14 @@ proofs of the four foundational mathematical theorems underlying **`fortchuck`**
    orthogonality $Q^\top Q = Q Q^\top = I_n$, Stiefel retraction preservation
    $(Q X)^\top (Q X) = X^\top X$, and exact isometric vector transport invariance of tangent
    skew-symmetry, skew projections, Frobenius cross-Gramians, and canonical Stiefel inner products.
-3. **Theorem 3 (`schur_woodbury_cayley_orthogonality` & `cayley_branch_a_eq_branch_b`)**:
+3. **Theorem 3 (`schur_woodbury_cayley_orthogonality`) & Theorem 4 (`cayley_branch_a_eq_branch_b`)**:
    For $X^\top X = I_p$, $A^\top = -A$, $X^\top K = 0$, dissipative Schur complement
    $J = I_p - \tfrac{\tau}{2} A + \tfrac{\tau^2}{4} K^\top K$, and inverse witness
    $J J_{\mathrm{inv}} = J_{\mathrm{inv}} J = I_p$, the Branch A Schur-Woodbury retraction
    $Y = (2X + \tau K) J_{\mathrm{inv}} - X$ satisfies $Y^\top Y = I_p$ identically, and agrees
    algebraically ($Q X = Y$) with the Branch B direct $n \times n$ Cayley rotor when
    $A = X^\top \xi$ and $K = \xi - X A$.
-4. **Theorem 4 (`coupled_two_metric_strict_descent`)**:
+4. **Theorem 5 (`coupled_two_metric_strict_descent`)**:
    Formalizes Theorem 2.1 of `ARCHITECTURE_SPEC.md`: under the safeguarded Bertsekas active-band
    partition coupled with a positive-definite masked product quasi-Newton operator on the joint
    free Box $\times$ Multi-Stiefel tangent subspace, free-coordinate clamping preserves descent
@@ -43,6 +43,17 @@ proofs of the four foundational mathematical theorems underlying **`fortchuck`**
    satisfies the exact two-metric quadratic upper bound, $\phi'(0^+) < 0$ holds strictly whenever
    any active-interior, free-box, or Stiefel gradient component is nonzero, and $\phi'(0^+) = 0$
    holds if and only if the iterate is first-order KKT stationary.
+5. **Theorem 6 (`simplex_box_projection_variational`)**:
+   Establishes primal feasibility, variational optimality, strong-convexity quadratic separation
+   (unique Euclidean projection), and unconditional isotropic Spectral Projected Gradient (`SPG`)
+   hyperplane tangency, convex segment feasibility, and strict descent on singly-linearly-constrained
+   box / simplex polytopes $\mathcal{C} = \{z \in [l, u]^d : a^\top z = b\}$.
+6. **Theorem 7 (`rank1_kkt_nullspace_quasinewton_descent`)**:
+   Establishes well-posedness ($a^\top H a > 0$), homogeneous and inhomogeneous hyperplane
+   tangency ($a^\top d = 0$ and $a^\top d_{\mathrm{inhom}} = \delta_b$), multiplier shift
+   invariance ($g \mapsto g + \mu a$), symmetric rank-1 operator form, and unconditional descent
+   ($g^\top d \le 0$, strictly $< 0$ whenever $g \notin \mathrm{span}(a)$) of the Rank-1 KKT
+   Nullspace quasi-Newton step.
 -/
 
 namespace Fortchuck
@@ -799,6 +810,329 @@ theorem coupled_two_metric_strict_descent {d R : ℕ} {n p : Fin R → ℕ}
           simp only [h_clamp_fix, ↓reduceIte, mul_zero]
       rw [h_box_sum_zero, h_st_sum_zero, add_zero]
   exact ⟨⟨h_free_clamp, h_act_sign⟩, h_main_bound, h_strict, h_kkt_iff⟩
+
+-- ============================================================================
+-- Section 5: Linearly-Constrained Box / Simplex Projection & SPG Descent (Theorem 6)
+-- ============================================================================
+
+/-- Dual-shifted coordinatewise clamping operator
+$z^\ast_i(\nu) = \min(u_i, \max(l_i, y_i - \nu a_i))$ characterizing the Euclidean projection
+onto $\mathcal{C} = \{z \in [l, u]^d : a^\top z = b\}$ (`ARCHITECTURE_SPEC.md` §2.9). -/
+def simplexBoxDualClamp {d : ℕ} (l u a y : Fin d → ℝ) (nu : ℝ) (i : Fin d) : ℝ :=
+  min (u i) (max (l i) (y i - nu * a i))
+
+/-- Coordinatewise clamping $\min(u_i, \max(l_i, w_i))$ onto any valid interval $l_i \le u_i$
+lies inside $[l_i, u_i]$. -/
+lemma clamp_mem_Icc {l_i u_i w_i : ℝ} (hl : l_i ≤ u_i) :
+    l_i ≤ min u_i (max l_i w_i) ∧ min u_i (max l_i w_i) ≤ u_i :=
+  ⟨le_min hl (le_max_left l_i w_i), min_le_left u_i (max l_i w_i)⟩
+
+/-- Pointwise 1D variational inequality for coordinatewise clamping onto $[l_i, u_i]$:
+for any $z_i \in [l_i, u_i]$,
+$(w_i - \min(u_i, \max(l_i, w_i)))(z_i - \min(u_i, \max(l_i, w_i))) \le 0$. -/
+lemma clamp_variational_nonpos {l_i u_i w_i z_i : ℝ}
+    (hl : l_i ≤ u_i) (hz_lo : l_i ≤ z_i) (hz_hi : z_i ≤ u_i) :
+    (w_i - min u_i (max l_i w_i)) * (z_i - min u_i (max l_i w_i)) ≤ 0 := by
+  rcases le_total w_i l_i with hwl | hlw
+  · rw [max_eq_left hwl, min_eq_right hl]
+    exact mul_nonpos_of_nonpos_of_nonneg (sub_nonpos.mpr hwl) (sub_nonneg.mpr hz_lo)
+  · rw [max_eq_right hlw]
+    rcases le_total w_i u_i with hwu | huw
+    · rw [min_eq_right hwu, sub_self, zero_mul]
+    · rw [min_eq_left huw]
+      exact mul_nonpos_of_nonneg_of_nonpos (sub_nonneg.mpr huw) (sub_nonpos.mpr hz_hi)
+
+/-- **Theorem 6 (`simplex_box_projection_variational`)**:
+For valid box bounds $l_i \le u_i$ on $\mathbb{R}^d$, if $z^\ast \in \mathbb{R}^d$ satisfies
+$z^\ast_i = \min(u_i, \max(l_i, y_i - \nu a_i))$ and $\sum_i a_i z^\ast_i = b$, then:
+- **(a)** Box feasibility: $l_i \le z^\ast_i \le u_i$ for every $i$;
+- **(b)** Variational inequality: $\sum_i (y_i - z^\ast_i)(z_i - z^\ast_i) \le 0$ for every
+  feasible $z \in \mathcal{C} = \{z \in [l, u]^d : \sum_i a_i z_i = b\}$;
+- **(c)** Strong-convexity quadratic bound & unique Euclidean projection:
+  $\|z^\ast - y\|_2^2 + \|z - z^\ast\|_2^2 \le \|z - y\|_2^2$, with strict inequality
+  $\|z^\ast - y\|_2^2 < \|z - y\|_2^2$ whenever $z \neq z^\ast$;
+- **(d)** Isotropic Spectral Projected Gradient (`SPG`) feasibility & strict descent: when
+  $y_i = z_{k,i} - \gamma g_i$ ($\gamma > 0$) at feasible $z_k \in \mathcal{C}$, the step
+  $d_{\mathrm{SPG}} = z^\ast - z_k$ satisfies $\sum_i a_i d_{\mathrm{SPG},i} = 0$, keeps the entire
+  segment $z_k + \tau d_{\mathrm{SPG}} \in \mathcal{C}$ feasible for $\tau \in [0, 1]$, and obeys
+  $\sum_i g_i d_{\mathrm{SPG},i} \le -\tfrac{1}{\gamma}\sum_i d_{\mathrm{SPG},i}^2$ (strictly $< 0$
+  whenever $\exists i, z^\ast_i \neq z_{k,i}$). -/
+theorem simplex_box_projection_variational {d : ℕ}
+    (l u a y z_star : Fin d → ℝ) (nu b : ℝ)
+    (hl : ∀ i : Fin d, l i ≤ u i)
+    (hz_star : ∀ i : Fin d, z_star i = min (u i) (max (l i) (y i - nu * a i)))
+    (hsum_star : (∑ i : Fin d, a i * z_star i) = b) :
+    (∀ i : Fin d, l i ≤ z_star i ∧ z_star i ≤ u i) ∧
+    (∀ z : Fin d → ℝ,
+      (∀ i : Fin d, l i ≤ z i) →
+      (∀ i : Fin d, z i ≤ u i) →
+      (∑ i : Fin d, a i * z i) = b →
+        (∑ i : Fin d, (y i - z_star i) * (z i - z_star i)) ≤ 0 ∧
+        (∑ i : Fin d, (z_star i - y i) ^ 2) + (∑ i : Fin d, (z i - z_star i) ^ 2) ≤
+          ∑ i : Fin d, (z i - y i) ^ 2 ∧
+        (z ≠ z_star →
+          (∑ i : Fin d, (z_star i - y i) ^ 2) < ∑ i : Fin d, (z i - y i) ^ 2)) ∧
+    (∀ (z_k g : Fin d → ℝ) (gamma : ℝ),
+      (∀ i : Fin d, l i ≤ z_k i ∧ z_k i ≤ u i) →
+      (∑ i : Fin d, a i * z_k i) = b →
+      0 < gamma →
+      (∀ i : Fin d, y i = z_k i - gamma * g i) →
+        let d_spg : Fin d → ℝ := fun i => z_star i - z_k i
+        (∑ i : Fin d, a i * d_spg i) = 0 ∧
+        (∀ τ : ℝ, 0 ≤ τ → τ ≤ 1 →
+          (∀ i : Fin d, l i ≤ z_k i + τ * d_spg i ∧ z_k i + τ * d_spg i ≤ u i) ∧
+          (∑ i : Fin d, a i * (z_k i + τ * d_spg i)) = b) ∧
+        (∑ i : Fin d, g i * d_spg i) ≤ -(1 / gamma) * (∑ i : Fin d, (d_spg i) ^ 2) ∧
+        ((∃ i : Fin d, z_star i ≠ z_k i) → (∑ i : Fin d, g i * d_spg i) < 0)) := by
+  have h_box : ∀ i : Fin d, l i ≤ z_star i ∧ z_star i ≤ u i := fun i => by
+    rw [hz_star i]
+    exact clamp_mem_Icc (hl i)
+  have h_proj : ∀ z : Fin d → ℝ,
+      (∀ i : Fin d, l i ≤ z i) →
+      (∀ i : Fin d, z i ≤ u i) →
+      (∑ i : Fin d, a i * z i) = b →
+        (∑ i : Fin d, (y i - z_star i) * (z i - z_star i)) ≤ 0 ∧
+        (∑ i : Fin d, (z_star i - y i) ^ 2) + (∑ i : Fin d, (z i - z_star i) ^ 2) ≤
+          ∑ i : Fin d, (z i - y i) ^ 2 ∧
+        (z ≠ z_star →
+          (∑ i : Fin d, (z_star i - y i) ^ 2) < ∑ i : Fin d, (z i - y i) ^ 2) := by
+    intro z hz_lo hz_hi hsum_z
+    have h_vi : (∑ i : Fin d, (y i - z_star i) * (z i - z_star i)) ≤ 0 := by
+      have h_split :
+          (∑ i : Fin d, (y i - z_star i) * (z i - z_star i)) =
+            (∑ i : Fin d, (y i - nu * a i - z_star i) * (z i - z_star i)) +
+              nu * ((∑ i : Fin d, a i * z i) - (∑ i : Fin d, a i * z_star i)) := by
+        have h_pt : ∀ i : Fin d,
+            (y i - z_star i) * (z i - z_star i) =
+              (y i - nu * a i - z_star i) * (z i - z_star i) +
+                (nu * (a i * z i) - nu * (a i * z_star i)) := fun i => by ring
+        simp_rw [h_pt, Finset.sum_add_distrib, Finset.sum_sub_distrib, ← Finset.mul_sum, ← mul_sub]
+      rw [h_split, hsum_z, hsum_star, sub_self, mul_zero, add_zero]
+      refine Finset.sum_nonpos fun i _ => ?_
+      rw [hz_star i]
+      exact clamp_variational_nonpos (hl i) (hz_lo i) (hz_hi i)
+    have h_alg :
+        (∑ i : Fin d, (z i - y i) ^ 2) =
+          (∑ i : Fin d, (z_star i - y i) ^ 2) + (∑ i : Fin d, (z i - z_star i) ^ 2) -
+            2 * (∑ i : Fin d, (y i - z_star i) * (z i - z_star i)) := by
+      have h_pt : ∀ i : Fin d,
+          (z i - y i) ^ 2 =
+            ((z_star i - y i) ^ 2 + (z i - z_star i) ^ 2) -
+              2 * ((y i - z_star i) * (z i - z_star i)) := fun i => by ring
+      simp_rw [h_pt, Finset.sum_sub_distrib, Finset.sum_add_distrib, ← Finset.mul_sum]
+    refine ⟨h_vi, by linarith, fun h_ne => ?_⟩
+    have ⟨i₀, hi₀⟩ : ∃ i : Fin d, z i ≠ z_star i := Function.ne_iff.mp h_ne
+    have h_sq_pos : 0 < (z i₀ - z_star i₀) ^ 2 := sq_pos_of_ne_zero (sub_ne_zero.mpr hi₀)
+    have h_sum_pos : 0 < ∑ i : Fin d, (z i - z_star i) ^ 2 :=
+      lt_of_lt_of_le h_sq_pos
+        (Finset.single_le_sum (fun j _ => sq_nonneg (z j - z_star j)) (Finset.mem_univ i₀))
+    linarith
+  refine ⟨h_box, h_proj, ?_⟩
+  intro z_k g gamma hzk_box hzk_sum hgamma hy
+  dsimp only
+  set d_spg : Fin d → ℝ := fun i => z_star i - z_k i
+  have h_tang : (∑ i : Fin d, a i * d_spg i) = 0 := by
+    have h_pt : ∀ i : Fin d, a i * d_spg i = a i * z_star i - a i * z_k i := fun i => by
+      dsimp [d_spg]; ring
+    simp_rw [h_pt, Finset.sum_sub_distrib, hsum_star, hzk_sum, sub_self]
+  have h_seg : ∀ τ : ℝ, 0 ≤ τ → τ ≤ 1 →
+      (∀ i : Fin d, l i ≤ z_k i + τ * d_spg i ∧ z_k i + τ * d_spg i ≤ u i) ∧
+      (∑ i : Fin d, a i * (z_k i + τ * d_spg i)) = b := by
+    intro τ hτ0 hτ1
+    refine ⟨fun i => ?_, ?_⟩
+    · have h_conv : z_k i + τ * d_spg i = (1 - τ) * z_k i + τ * z_star i := by
+        dsimp [d_spg]; ring
+      rw [h_conv]
+      constructor <;> nlinarith [(hzk_box i).1, (hzk_box i).2, (h_box i).1, (h_box i).2]
+    · have h_pt : ∀ i : Fin d, a i * (z_k i + τ * d_spg i) = a i * z_k i + τ * (a i * d_spg i) :=
+        fun i => by ring
+      simp_rw [h_pt, Finset.sum_add_distrib, ← Finset.mul_sum, hzk_sum, h_tang, mul_zero, add_zero]
+  have h_vi_zk := (h_proj z_k (fun i => (hzk_box i).1) (fun i => (hzk_box i).2) hzk_sum).1
+  have h_spg_rel :
+      (∑ i : Fin d, (d_spg i) ^ 2) + gamma * (∑ i : Fin d, g i * d_spg i) ≤ 0 := by
+    have h_pt : ∀ i : Fin d,
+        (y i - z_star i) * (z_k i - z_star i) = (d_spg i) ^ 2 + gamma * (g i * d_spg i) := by
+      intro i
+      rw [hy i]
+      dsimp [d_spg]
+      ring
+    simp_rw [h_pt, Finset.sum_add_distrib, ← Finset.mul_sum] at h_vi_zk
+    exact h_vi_zk
+  have h_inv_pos : 0 < 1 / gamma := div_pos one_pos hgamma
+  have h_scaled :
+      (1 / gamma) * ((∑ i : Fin d, (d_spg i) ^ 2) + gamma * (∑ i : Fin d, g i * d_spg i)) ≤ 0 :=
+    mul_nonpos_of_nonneg_of_nonpos (le_of_lt h_inv_pos) h_spg_rel
+  have h_cancel :
+      (1 / gamma) * (gamma * (∑ i : Fin d, g i * d_spg i)) = ∑ i : Fin d, g i * d_spg i := by
+    rw [← mul_assoc, one_div_mul_cancel (ne_of_gt hgamma), one_mul]
+  have h_desc : (∑ i : Fin d, g i * d_spg i) ≤ -(1 / gamma) * (∑ i : Fin d, (d_spg i) ^ 2) := by
+    linarith
+  refine ⟨h_tang, h_seg, h_desc, fun ⟨i₀, hi₀⟩ => ?_⟩
+  have h_sq_pos : 0 < (d_spg i₀) ^ 2 := sq_pos_of_ne_zero (sub_ne_zero.mpr hi₀)
+  have h_sum_pos : 0 < ∑ i : Fin d, (d_spg i) ^ 2 :=
+    lt_of_lt_of_le h_sq_pos
+      (Finset.single_le_sum (fun j _ => sq_nonneg (d_spg j)) (Finset.mem_univ i₀))
+  have h_prod_pos : 0 < (1 / gamma) * (∑ i : Fin d, (d_spg i) ^ 2) := mul_pos h_inv_pos h_sum_pos
+  linarith
+
+-- ============================================================================
+-- Section 6: Rank-1 KKT Nullspace Quasi-Newton Descent & Shift Invariance (Theorem 7)
+-- ============================================================================
+
+/-- Homogeneous Rank-1 KKT Nullspace quasi-Newton search direction
+$d_{\mathrm{KKT}}(g) = u - \frac{a^\top u}{a^\top w} w$ with $u = -H g$ and $w = H a$
+(`ARCHITECTURE_SPEC.md` §2.9). -/
+def kktNullspaceStep {n : ℕ}
+    (H : Matrix (Fin n) (Fin n) ℝ) (a g : Fin n → ℝ) : Fin n → ℝ :=
+  let u := -(H.mulVec g)
+  let w := H.mulVec a
+  u - (dotProduct a u / dotProduct a w) • w
+
+/-- Inhomogeneous Rank-1 KKT Nullspace quasi-Newton search direction with boundary-snap target
+$\delta_b \in \mathbb{R}$: $d_{\mathrm{KKT}}(g, \delta_b) = u - \frac{a^\top u - \delta_b}{a^\top w} w$. -/
+def kktNullspaceStepInhom {n : ℕ}
+    (H : Matrix (Fin n) (Fin n) ℝ) (a g : Fin n → ℝ) (delta_b : ℝ) : Fin n → ℝ :=
+  let u := -(H.mulVec g)
+  let w := H.mulVec a
+  u - ((dotProduct a u - delta_b) / dotProduct a w) • w
+
+/-- Symmetry of the bilinear form $x^\top (H y) = y^\top (H x)$ for any symmetric matrix
+$H^\top = H$. -/
+lemma dotProduct_mulVec_symm {n : ℕ}
+    (H : Matrix (Fin n) (Fin n) ℝ) (hSymm : Hᵀ = H) (x y : Fin n → ℝ) :
+    dotProduct x (H.mulVec y) = dotProduct y (H.mulVec x) := by
+  calc
+    dotProduct x (H.mulVec y) = dotProduct (H.vecMul x) y := Matrix.dotProduct_mulVec x H y
+    _ = dotProduct (Hᵀ.mulVec x) y := by rw [Matrix.mulVec_transpose]
+    _ = dotProduct (H.mulVec x) y := by rw [hSymm]
+    _ = dotProduct y (H.mulVec x) := dotProduct_comm _ _
+
+/-- **Theorem 7 (`rank1_kkt_nullspace_quasinewton_descent`)**:
+For any symmetric positive-definite matrix $H \in \mathbb{R}^{n \times n}$ ($H^\top = H$ and
+$\forall v \neq 0, v^\top H v > 0$) and nonzero constraint normal $a \in \mathbb{R}^n \setminus \{0\}$,
+defining $d_{\mathrm{KKT}}(g) = u - \frac{a^\top u}{a^\top w} w$ with $u = -H g$ and $w = H a$
+(and witness $v = g - \frac{a^\top H g}{a^\top H a} a$):
+- **(a)** Well-posedness: $a^\top H a > 0$;
+- **(b)** Exact hyperplane tangency: $a^\top d_{\mathrm{KKT}}(g) = 0$, and for any inhomogeneous
+  boundary-snap target $\delta_b \in \mathbb{R}$,
+  $a^\top \bigl(u - \frac{a^\top u - \delta_b}{a^\top w} w\bigr) = \delta_b$;
+- **(c)** Multiplier shift invariance: $d_{\mathrm{KKT}}(g + \mu a) = d_{\mathrm{KKT}}(g)$ for all
+  $\mu \in \mathbb{R}$;
+- **(d)** Quadratic-form witness identity, symmetric rank-1 operator form, guaranteed descent, and
+  strict non-collinear descent: $v^\top H v = -g^\top d_{\mathrm{KKT}}(g)$,
+  $d_{\mathrm{KKT}}(g) = -\bigl(H g - \frac{w^\top g}{a^\top w} w\bigr)$,
+  $g^\top d_{\mathrm{KKT}}(g) \le 0$, $g^\top d_{\mathrm{KKT}}(g) < 0$ whenever
+  $\forall \mu \in \mathbb{R}, g \neq \mu a$, and $g^\top d_{\mathrm{KKT}}(g) = 0 \iff \exists \mu, g = \mu a$. -/
+theorem rank1_kkt_nullspace_quasinewton_descent {n : ℕ}
+    (H : Matrix (Fin n) (Fin n) ℝ)
+    (a g : Fin n → ℝ)
+    (hSymm : Hᵀ = H)
+    (hPosDef : ∀ v : Fin n → ℝ, v ≠ 0 → 0 < dotProduct v (H.mulVec v))
+    (ha : a ≠ 0) :
+    let d_kkt : (Fin n → ℝ) → (Fin n → ℝ) := fun g' =>
+      let u := -(H.mulVec g')
+      let w := H.mulVec a
+      u - (dotProduct a u / dotProduct a w) • w
+    let v : Fin n → ℝ :=
+      g - (dotProduct a (H.mulVec g) / dotProduct a (H.mulVec a)) • a
+    (0 < dotProduct a (H.mulVec a)) ∧
+    (dotProduct a (d_kkt g) = 0 ∧
+      ∀ delta_b : ℝ,
+        let u := -(H.mulVec g)
+        let w := H.mulVec a
+        dotProduct a (u - ((dotProduct a u - delta_b) / dotProduct a w) • w) = delta_b) ∧
+    (∀ μ : ℝ, d_kkt (g + μ • a) = d_kkt g) ∧
+    (dotProduct v (H.mulVec v) = -dotProduct g (d_kkt g) ∧
+      d_kkt g = -(H.mulVec g - (dotProduct (H.mulVec a) g / dotProduct a (H.mulVec a)) • H.mulVec a) ∧
+      dotProduct g (d_kkt g) ≤ 0 ∧
+      ((∀ μ : ℝ, g ≠ μ • a) → dotProduct g (d_kkt g) < 0) ∧
+      (dotProduct g (d_kkt g) = 0 ↔ ∃ μ : ℝ, g = μ • a)) := by
+  dsimp only
+  set w := H.mulVec a with hw_def
+  have haw_pos : 0 < dotProduct a w := hPosDef a ha
+  have haw_ne : dotProduct a w ≠ 0 := ne_of_gt haw_pos
+  have h_inhom : ∀ (g' : Fin n → ℝ) (delta_b : ℝ),
+      dotProduct a (-(H.mulVec g') - ((dotProduct a (-(H.mulVec g')) - delta_b) / dotProduct a w) • w) =
+        delta_b := by
+    intro g' delta_b
+    rw [dotProduct_sub, dotProduct_smul, smul_eq_mul, div_mul_cancel₀ _ haw_ne]
+    ring
+  have h_tang : dotProduct a (-(H.mulVec g) - (dotProduct a (-(H.mulVec g)) / dotProduct a w) • w) = 0 := by
+    have h0 := h_inhom g 0
+    simpa only [sub_zero] using h0
+  have h_shift : ∀ μ : ℝ,
+      -(H.mulVec (g + μ • a)) - (dotProduct a (-(H.mulVec (g + μ • a))) / dotProduct a w) • w =
+        -(H.mulVec g) - (dotProduct a (-(H.mulVec g)) / dotProduct a w) • w := by
+    intro μ
+    have hu_shift : -(H.mulVec (g + μ • a)) = -(H.mulVec g) - μ • w := by
+      rw [Matrix.mulVec_add, Matrix.mulVec_smul, ← hw_def, neg_add_rev]
+      abel
+    have h_dot_shift :
+        dotProduct a (-(H.mulVec (g + μ • a))) / dotProduct a w =
+          dotProduct a (-(H.mulVec g)) / dotProduct a w - μ := by
+      rw [hu_shift, dotProduct_sub, dotProduct_smul, smul_eq_mul, sub_div,
+        mul_div_cancel_right₀ μ haw_ne]
+    rw [h_dot_shift, hu_shift]
+    ext i
+    simp only [Pi.sub_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  set α : ℝ := dotProduct a (H.mulVec g) / dotProduct a w with hα_def
+  set v : Fin n → ℝ := g - α • a with hv_def
+  set d : Fin n → ℝ := -(H.mulVec g) - (dotProduct a (-(H.mulVec g)) / dotProduct a w) • w with hd_def
+  have hd_eq_neg_Hv : d = -(H.mulVec v) := by
+    have h_au : dotProduct a (-(H.mulVec g)) / dotProduct a w = -α := by
+      rw [dotProduct_neg, neg_div, ← hα_def]
+    rw [hd_def, h_au, hv_def, Matrix.mulVec_sub, Matrix.mulVec_smul, ← hw_def]
+    ext i
+    simp only [Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  have h_aHv : dotProduct a (H.mulVec v) = 0 := by
+    rw [hv_def, Matrix.mulVec_sub, Matrix.mulVec_smul, ← hw_def,
+      dotProduct_sub, dotProduct_smul, smul_eq_mul, hα_def, div_mul_cancel₀ _ haw_ne, sub_self]
+  have h_quad_id : dotProduct v (H.mulVec v) = -dotProduct g d := by
+    have h_sym_va : dotProduct v w = 0 := by
+      rw [hw_def, dotProduct_mulVec_symm H hSymm v a, h_aHv]
+    have _ := h_sym_va
+    rw [hv_def, sub_dotProduct, smul_dotProduct, smul_eq_mul, h_aHv, mul_zero, sub_zero,
+      hd_eq_neg_Hv, dotProduct_neg, neg_neg]
+  have h_sym_op :
+      d = -(H.mulVec g - (dotProduct w g / dotProduct a w) • w) := by
+    have h_ag_wg : dotProduct a (H.mulVec g) = dotProduct w g := by
+      rw [hw_def, dotProduct_mulVec_symm H hSymm a g, dotProduct_comm]
+    have h_au : dotProduct a (-(H.mulVec g)) / dotProduct a w = -(dotProduct w g / dotProduct a w) := by
+      rw [dotProduct_neg, h_ag_wg, neg_div]
+    rw [hd_def, h_au]
+    ext i
+    simp only [Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul]
+    ring
+  have hv_nonneg : 0 ≤ dotProduct v (H.mulVec v) := by
+    by_cases hv0 : v = 0
+    · rw [hv0, zero_dotProduct]
+    · exact le_of_lt (hPosDef v hv0)
+  have h_desc_nonpos : dotProduct g d ≤ 0 := by linarith
+  have h_strict : (∀ μ : ℝ, g ≠ μ • a) → dotProduct g d < 0 := by
+    intro h_noncol
+    have hv_ne : v ≠ 0 := by
+      intro hv0
+      exact h_noncol α (sub_eq_zero.mp hv0)
+    have hv_pos : 0 < dotProduct v (H.mulVec v) := hPosDef v hv_ne
+    linarith
+  have h_zero_iff : dotProduct g d = 0 ↔ ∃ μ : ℝ, g = μ • a := by
+    constructor
+    · intro hg0
+      by_cases hv0 : v = 0
+      · exact ⟨α, sub_eq_zero.mp hv0⟩
+      · have hv_pos : 0 < dotProduct v (H.mulVec v) := hPosDef v hv0
+        linarith
+    · rintro ⟨μ, rfl⟩
+      have hd0 : d = 0 := by
+        have h_s := h_shift (-μ)
+        have h_cancel : μ • a + (-μ) • a = (0 : Fin n → ℝ) := by module
+        rw [h_cancel] at h_s
+        rw [← h_s, Matrix.mulVec_zero, neg_zero, dotProduct_zero, zero_div, zero_smul, sub_zero]
+      rw [hd0, dotProduct_zero]
+  exact ⟨haw_pos, ⟨h_tang, h_inhom g⟩, h_shift,
+    h_quad_id, h_sym_op, h_desc_nonpos, h_strict, h_zero_iff⟩
 
 end
 

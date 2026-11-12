@@ -7,6 +7,7 @@ Verifies:
   4. Pre-Callback Positive-Diagonal Householder-QR Polish & Strict Feasibility Invariant (FM-8).
   5. Rosen Boundary Non-Jamming (FM-1) & `+-DBL_MAX` Overflow Safety (FM-9).
   6. Multi-Threaded Python `ThreadPoolExecutor` Bit-Reproducibility.
+  7. FM-13 Non-Isotropic Hyperplane Ascent & Simplex Corner Release (`kappa = 1e4` on `Delta_8 x St(10, 3)`).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from fortchuck import (
     FC_CONVERGED_GRAD,
     FCOptions,
     FortchuckWorkspace,
+    kkt_residual,
     minimize_box_stiefel,
     project_stiefel,
 )
@@ -383,3 +385,114 @@ def test_multithreaded_python_parallel_reentrancy() -> None:
         assert np.array_equal(z_s, z_p)
         for x_s, x_p in zip(xs_s, xs_p):
             assert np.array_equal(x_s, x_p)
+
+
+@pytest.mark.parametrize("seed", [0, 7, 42, 101, 2026])
+def test_fm13_non_isotropic_hyperplane_and_simplex_corner_release(seed: int) -> None:
+    """`ARCHITECTURE_SPEC.md` §5.2 FM-13 Non-Isotropic Hyperplane Ascent & Simplex Corner Release:
+
+    Ill-conditioned (`kappa = 1e4`) coupled quadratic + Brockett problem on `Delta_8 x St(10, 3)`
+    initialized directly at suboptimal simplex vertex `e_1 = (1, 0, ..., 0)` where all `d`
+    coordinates sit on box bounds (`z_1 = 1`, `z_{2..8} = 0`). Verifies immediate strict-descent
+    release from `e_1`, strict feasibility at every callback evaluation, and convergence to
+    `E_KKT <= 1e-9` and `|1^T z* - 1| <= 1e-14`.
+    """
+    rng = np.random.default_rng(seed)
+    d = 8
+    n, p = 10, 3
+
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.ones(d, dtype=np.float64)
+    a_ones = np.ones(d, dtype=np.float64)
+
+    # Construct dense SPD Hessian M on R^8 with exact condition number kappa_2(M) = 10^4
+    Q8 = project_stiefel(np.asfortranarray(rng.standard_normal((d, d))))
+    eigs = 10.0 ** (4.0 * np.arange(d, dtype=np.float64) / float(d - 1))
+    M = (Q8 * eigs[None, :]) @ Q8.T
+    M = 0.5 * (M + M.T)
+
+    # Target puts optimal mass on coordinates 2..5 while vertex e_1 = (1, 0, ..., 0) is suboptimal
+    z_targ = np.array([-0.5, -0.3, 0.35, 0.30, 0.25, 0.20, -0.2, -0.2], dtype=np.float64)
+    d_st = 0.6 * np.arange(1.0, n + 1.0, dtype=np.float64)
+
+    # Initialize right at suboptimal simplex corner e_1 = (1, 0, ..., 0)
+    z0 = np.zeros(d, dtype=np.float64)
+    z0[0] = 1.0
+    X0 = project_stiefel(np.asfortranarray(rng.standard_normal((n, p))))
+
+    z0_trace: list[float] = []
+    max_cb_lin_err = 0.0
+    max_cb_box_viol = 0.0
+    max_cb_orth_err = 0.0
+
+    def fg_fm13(
+        z: np.ndarray, xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        nonlocal max_cb_lin_err, max_cb_box_viol, max_cb_orth_err
+        X = xs[0]
+        z0_trace.append(float(z[0]))
+        max_cb_lin_err = max(max_cb_lin_err, abs(float(np.sum(z)) - 1.0))
+        max_cb_box_viol = max(
+            max_cb_box_viol, float(max(0.0, np.max(lower - z), np.max(z - upper)))
+        )
+        max_cb_orth_err = max(
+            max_cb_orth_err, float(np.linalg.norm(X.T @ X - np.eye(p), ord="fro"))
+        )
+
+        dz = z - z_targ
+        Mdz = M @ dz
+        f_box = 0.5 * float(np.dot(dz, Mdz))
+        gz = Mdz.copy()
+
+        # Coupled Brockett term modulated by z[1..3]
+        col_weights = np.array(
+            [0.4 + float(z[1 + j]) + 0.05 * float(j + 1) for j in range(p)],
+            dtype=np.float64,
+        )
+        DX = d_st[:, None] * X
+        col_quad = np.sum(X * DX, axis=0)
+        f_st = 0.5 * float(np.dot(col_weights, col_quad))
+        gz[1 : 1 + p] += 0.5 * col_quad
+        GX = np.asfortranarray(DX * col_weights[None, :])
+        return f_box + f_st, gz, [GX]
+
+    res = minimize_box_stiefel(
+        fg_fm13,
+        z0=z0,
+        bounds=(lower, upper),
+        X0_list=X0,
+        options=FCOptions(gtol=1.0e-9, max_iter=2000, max_eval=8000),
+        linear_constraint=(a_ones, 1.0),
+        copy=True,
+    )
+
+    assert res.status == FC_CONVERGED_GRAD
+    assert res.kkt_residual <= 1.0e-9
+    assert abs(float(np.sum(res.z)) - 1.0) <= 1.0e-14
+    assert res.orth_error <= 1.0e-13
+
+    # Verify immediate corner release on first trial step after initial evaluation p_0
+    assert len(z0_trace) >= 2
+    assert z0_trace[0] == 1.0
+    assert z0_trace[1] < 1.0, f"Expected immediate corner release from e_1 on step 0 (seed={seed})"
+    assert res.z[0] < 0.2, f"Suboptimal vertex e_1 was not released: z*[0]={res.z[0]}"
+
+    # Every callback evaluation saw strictly feasible simplex and Stiefel iterates
+    assert max_cb_lin_err <= 1.0e-14
+    assert max_cb_box_viol <= 1.0e-15
+    assert max_cb_orth_err <= 1.0e-13
+
+    # Independent constrained KKT residual parity
+    _, gz_fin, gx_fin = fg_fm13(res.z, res.X_list)
+    kkt_chk, lin_chk, orth_chk = kkt_residual(
+        z=res.z,
+        bounds=(lower, upper),
+        X_list=res.X_list,
+        gz=gz_fin,
+        GX_list=gx_fin,
+        linear_constraint=(a_ones, 1.0),
+    )
+    assert kkt_chk == pytest.approx(res.kkt_residual, abs=1.0e-14)
+    assert kkt_chk <= 1.0e-9
+    assert lin_chk <= 1.0e-14
+    assert orth_chk <= 1.0e-13

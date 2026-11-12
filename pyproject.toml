@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fortchuck"
-version = "0.1.0"
-description = "Zero-allocation, OpenMP-reentrant Modern Fortran 2018 Coupled Box x Stiefel Quasi-Newton Optimizer with Zero-Copy C99 and Python Bindings"
+version = "0.2.0"
+description = "Zero-allocation, OpenMP-reentrant Modern Fortran 2018 Coupled Box/Simplex x Stiefel Quasi-Newton Optimizer with Zero-Copy C99 and Python Bindings"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "CC0-1.0" }

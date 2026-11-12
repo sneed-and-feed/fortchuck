@@ -35,6 +35,7 @@ FC_ERR_CALLBACK_NAN: int = -6
 FC_ERR_CALLBACK_ABORT: int = -7
 FC_ERR_LS_FAILED: int = -8
 FC_ERR_INVALID_OPTS: int = -9
+FC_ERR_INFEASIBLE_LIN: int = -10
 
 FC_METRIC_CANONICAL: int = 0
 FC_METRIC_EUCLIDEAN: int = 1
@@ -58,6 +59,7 @@ STATUS_NAMES: dict[int, str] = {
     FC_ERR_CALLBACK_ABORT: "FC_ERR_CALLBACK_ABORT",
     FC_ERR_LS_FAILED: "FC_ERR_LS_FAILED",
     FC_ERR_INVALID_OPTS: "FC_ERR_INVALID_OPTS",
+    FC_ERR_INFEASIBLE_LIN: "FC_ERR_INFEASIBLE_LIN",
 }
 
 # =============================================================================
@@ -354,6 +356,7 @@ def _find_or_build_shared_library() -> Path:
 def _configure_c_signatures(lib: ctypes.CDLL) -> None:
     c_i32 = ctypes.c_int32
     c_i64 = ctypes.c_int64
+    c_f64 = ctypes.c_double
     c_i32_p = ctypes.POINTER(ctypes.c_int32)
     c_i64_p = ctypes.POINTER(ctypes.c_int64)
     c_f64_p = ctypes.POINTER(ctypes.c_double)
@@ -392,6 +395,28 @@ def _configure_c_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.fortchuck_solve.restype = c_i32
 
+    lib.fortchuck_solve_constrained.argtypes = [
+        c_i32,
+        c_i32,
+        c_i32_p,
+        c_i32_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64,
+        c_f64_p,
+        FCEvalCallback,
+        ctypes.c_void_p,
+        ctypes.POINTER(FCOptions),
+        c_f64_p,
+        c_i64,
+        c_i32_p,
+        c_i64,
+        ctypes.POINTER(FCResult),
+    ]
+    lib.fortchuck_solve_constrained.restype = c_i32
+
     lib.fortchuck_project_stiefel.argtypes = [
         c_i32,
         c_i32,
@@ -400,6 +425,17 @@ def _configure_c_signatures(lib: ctypes.CDLL) -> None:
         c_i64,
     ]
     lib.fortchuck_project_stiefel.restype = c_i32
+
+    lib.fortchuck_project_linear_box.argtypes = [
+        c_i32,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64,
+        c_f64_p,
+        c_f64_p,
+    ]
+    lib.fortchuck_project_linear_box.restype = c_i32
 
     lib.fortchuck_kkt_residual.argtypes = [
         c_i32,
@@ -419,6 +455,28 @@ def _configure_c_signatures(lib: ctypes.CDLL) -> None:
         c_f64_p,
     ]
     lib.fortchuck_kkt_residual.restype = c_i32
+
+    lib.fortchuck_kkt_residual_constrained.argtypes = [
+        c_i32,
+        c_i32,
+        c_i32_p,
+        c_i32_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_f64,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+        c_i32,
+        c_f64_p,
+        c_i64,
+        c_f64_p,
+        c_f64_p,
+        c_f64_p,
+    ]
+    lib.fortchuck_kkt_residual_constrained.restype = c_i32
 
 
 def load_native_library() -> ctypes.CDLL:

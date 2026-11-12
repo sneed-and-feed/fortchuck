@@ -30,6 +30,7 @@ module fortchuck_kinds
   integer(i32), parameter, public :: FC_ERR_CALLBACK_ABORT = -7_i32
   integer(i32), parameter, public :: FC_ERR_LS_FAILED      = -8_i32
   integer(i32), parameter, public :: FC_ERR_INVALID_OPTS   = -9_i32
+  integer(i32), parameter, public :: FC_ERR_INFEASIBLE_LIN = -10_i32
 
   ! Stiefel Riemannian metric family selectors
   integer(i32), parameter, public :: FC_METRIC_CANONICAL = 0_i32

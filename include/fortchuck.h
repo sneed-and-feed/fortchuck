@@ -9,21 +9,22 @@ extern "C" {
 
 /* Status and error codes */
 enum fc_status_e {
-    FC_SUCCESS_QUERY       =  0,
-    FC_CONVERGED_GRAD      =  1,
-    FC_CONVERGED_FTOL      =  2,
-    FC_CONVERGED_XTOL      =  3,
-    FC_MAX_ITER_REACHED    =  4,
-    FC_MAX_EVAL_REACHED    =  5,
-    FC_ERR_INVALID_DIM     = -1,
-    FC_ERR_NULL_PTR        = -2,
-    FC_ERR_INVALID_BOUNDS  = -3,
-    FC_ERR_INVALID_X0      = -4,
-    FC_ERR_WORK_TOO_SMALL  = -5,
-    FC_ERR_CALLBACK_NAN    = -6,
-    FC_ERR_CALLBACK_ABORT  = -7,
-    FC_ERR_LS_FAILED       = -8,
-    FC_ERR_INVALID_OPTS    = -9
+    FC_SUCCESS_QUERY       =   0,
+    FC_CONVERGED_GRAD      =   1,
+    FC_CONVERGED_FTOL      =   2,
+    FC_CONVERGED_XTOL      =   3,
+    FC_MAX_ITER_REACHED    =   4,
+    FC_MAX_EVAL_REACHED    =   5,
+    FC_ERR_INVALID_DIM     =  -1,
+    FC_ERR_NULL_PTR        =  -2,
+    FC_ERR_INVALID_BOUNDS  =  -3,
+    FC_ERR_INVALID_X0      =  -4,
+    FC_ERR_WORK_TOO_SMALL  =  -5,
+    FC_ERR_CALLBACK_NAN    =  -6,
+    FC_ERR_CALLBACK_ABORT  =  -7,
+    FC_ERR_LS_FAILED       =  -8,
+    FC_ERR_INVALID_OPTS    =  -9,
+    FC_ERR_INFEASIBLE_LIN  = -10
 };
 
 enum fc_metric_e {
@@ -48,7 +49,7 @@ typedef struct fc_options_t {
     double  max_step_vel;     /* Default: 2*pi    */
     int32_t max_iter;         /* Default: 15000   */
     int32_t max_eval;         /* Default: 15000   */
-    int32_t memory;           /* Default: 7 (0 = pure ABB steepest descent) */
+    int32_t memory;           /* Default: 7 (0 = pure ABB/SPG steepest descent) */
     int32_t metric;           /* Default: FC_METRIC_CANONICAL (0) */
     int32_t damping_mode;     /* Default: FC_DAMP_CAUTIOUS (0)    */
     int32_t project_initial;  /* Default: 1 (project z0, polish full-rank X0) */
@@ -121,12 +122,47 @@ int32_t fortchuck_solve(
     fc_result_t *res
 );
 
+/* Coupled singly-linearly-constrained Box / Simplex x Multi-Stiefel solver (v0.2.0):
+ * Minimizes f(z, X_1..X_R) subject to l_i <= z_i <= u_i, a^T z = b, and X_r^T X_r = I_{p_r}. */
+int32_t fortchuck_solve_constrained(
+    int32_t d,
+    int32_t R,
+    const int32_t *n_arr,
+    const int32_t *p_arr,
+    double *z,
+    const double *l,
+    const double *u,
+    const double *a,
+    double b,
+    double *X_packed,
+    fc_eval_fg_cb eval_fg,
+    void *udata,
+    const fc_options_t *opts,
+    double *work,
+    int64_t lwork,
+    int32_t *iwork,
+    int64_t liwork,
+    fc_result_t *res
+);
+
 int32_t fortchuck_project_stiefel(
     int32_t n,
     int32_t p,
     double *X,
     double *work,
     int64_t lwork
+);
+
+/* Zero-workspace Euclidean projection onto {z in [l, u]^d : a^T z = b} (v0.2.0):
+ * Projects z[0..d-1] in-place; writes dual multiplier to *nu_out if nu_out != NULL. */
+int32_t fortchuck_project_linear_box(
+    int32_t d,
+    const double *l,
+    const double *u,
+    const double *a,
+    double b,
+    double *z,
+    double *nu_out
 );
 
 int32_t fortchuck_kkt_residual(
@@ -144,6 +180,29 @@ int32_t fortchuck_kkt_residual(
     double *work,
     int64_t lwork,
     double *kkt_inf_out,
+    double *orth_err_out
+);
+
+/* Constrained KKT & linear/orthogonality feasibility certificate (v0.2.0):
+ * Supports lwork == -1 workspace query (minimum lwork = max(1, d + max_r(n_r*p_r + 3*p_r^2))). */
+int32_t fortchuck_kkt_residual_constrained(
+    int32_t d,
+    int32_t R,
+    const int32_t *n_arr,
+    const int32_t *p_arr,
+    const double *z,
+    const double *l,
+    const double *u,
+    const double *a,
+    double b,
+    const double *X_packed,
+    const double *gz,
+    const double *GX_packed,
+    int32_t metric,
+    double *work,
+    int64_t lwork,
+    double *kkt_inf_out,
+    double *lin_err_out,
     double *orth_err_out
 );
 

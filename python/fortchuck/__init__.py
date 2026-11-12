@@ -1,9 +1,9 @@
-"""`fortchuck`: Zero-Allocation Coupled Box x Stiefel Quasi-Newton Optimizer.
+"""`fortchuck`: Zero-Allocation Coupled Box/Simplex x Stiefel Quasi-Newton Optimizer.
 
 Exposes zero-copy C99/Fortran 2018 bindings (`minimize_box_stiefel`,
 `FortchuckWorkspace`, `FCOptions`, `FCResult`, `OptimizeResult`,
-`project_stiefel`, `kkt_residual`, `workspace_query`, `default_options`) and
-all deterministic status, metric, and damping constants.
+`project_stiefel`, `project_linear_box`, `kkt_residual`, `workspace_query`,
+`default_options`) and all deterministic status, metric, and damping constants.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from fortchuck._native import (
     FC_DAMP_POWELL,
     FC_ERR_CALLBACK_ABORT,
     FC_ERR_CALLBACK_NAN,
+    FC_ERR_INFEASIBLE_LIN,
     FC_ERR_INVALID_BOUNDS,
     FC_ERR_INVALID_DIM,
     FC_ERR_INVALID_OPTS,
@@ -41,11 +42,12 @@ from fortchuck.solver import (
     default_options,
     kkt_residual,
     minimize_box_stiefel,
+    project_linear_box,
     project_stiefel,
     workspace_query,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -56,6 +58,7 @@ __all__ = [
     "default_options",
     "workspace_query",
     "project_stiefel",
+    "project_linear_box",
     "kkt_residual",
     # Native C-ABI structures & loader
     "FCOptions",
@@ -80,6 +83,7 @@ __all__ = [
     "FC_ERR_CALLBACK_ABORT",
     "FC_ERR_LS_FAILED",
     "FC_ERR_INVALID_OPTS",
+    "FC_ERR_INFEASIBLE_LIN",
     # Metric & damping enums
     "FC_METRIC_CANONICAL",
     "FC_METRIC_EUCLIDEAN",

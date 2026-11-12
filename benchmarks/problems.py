@@ -1,4 +1,4 @@
-"""Canonical 9-instance blind benchmark problem suite for fortchuck.
+"""Canonical 11-instance blind benchmark problem suite for fortchuck (v0.2.0).
 
 Implements exact closed-form smooth objectives and Euclidean partial gradients
 (grad_z f, grad_{X_1} f, ..., grad_{X_R} f) following:
@@ -7,7 +7,9 @@ Implements exact closed-form smooth objectives and Euclidean partial gradients
 
 Maintaining strict separation from Fortran solver internals (`src/*.f90`), all
 problem matrices are deterministically generated from fixed canonical problem
-seeds via PCG64, independent of initial-point seeds (101..110 or 201..210).
+seeds via PCG64, independent of initial-point seeds (101..110, 201..210, 301..310).
+Instances B1..B7B remain 100% bit-for-bit identical to v0.1.0; v0.2.0 adds
+coupled singly-linearly-constrained box/simplex x Stiefel problems B8A and B8B.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ BENCHMARK_IDS: tuple[str, ...] = (
     "B6",
     "B7A",
     "B7B",
+    "B8A",
+    "B8B",
 )
 
 EvalFGCallable = Callable[
@@ -53,7 +57,7 @@ def _random_orthonormal(
 
 @dataclass(frozen=True)
 class BenchmarkProblem:
-    """Immutable specification of a Coupled Box x Multi-Stiefel benchmark instance."""
+    """Immutable specification of a Coupled Box/Simplex x Multi-Stiefel benchmark instance."""
 
     problem_id: str
     name: str
@@ -64,9 +68,15 @@ class BenchmarkProblem:
     n_list: tuple[int, ...]
     p_list: tuple[int, ...]
     eval_fg: EvalFGCallable
+    lin_a: np.ndarray | None = None
+    lin_b: float | None = None
     f_star: float | None = None
     z_star: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def fun_and_grad(self) -> EvalFGCallable:
+        return self.eval_fg
 
     @property
     def R(self) -> int:
@@ -83,7 +93,8 @@ class BenchmarkProblem:
     @property
     def intrinsic_dim(self) -> int:
         st_dim = sum(n * p - (p * (p + 1)) // 2 for n, p in zip(self.n_list, self.p_list))
-        return int(self.d + st_dim)
+        lin_codim = 1 if (self.lin_a is not None and self.d > 0) else 0
+        return int(self.d - lin_codim + st_dim)
 
 
 def _build_b1_ensemble_dft() -> BenchmarkProblem:
@@ -762,6 +773,213 @@ def _build_b7b_pure_stiefel_brockett_procrustes() -> BenchmarkProblem:
     )
 
 
+def _build_b8a_trace_constrained_dft() -> BenchmarkProblem:
+    """B8A: Trace-Constrained Ensemble Kohn-Sham DFT (Hard Electron Conservation).
+
+    Domain: z in {z in [0, 1]^12 : 1^T z = 5.0} x X in St(120, 12) (Branch A).
+    Tests hard Fermi-Dirac trace conservation (SLBQP + Rank-1 KKT Nullspace Two-Loop)
+    on a metallic dimer Hamiltonian without soft (1^T z - N_e)^2 penalty.
+    """
+    rng = np.random.Generator(np.random.PCG64(20260801))
+    n, p = 120, 12
+    dom_len = 24.0
+    dx = dom_len / n
+    grid = np.linspace(0.0, dom_len, n, endpoint=False)
+
+    lap = np.zeros((n, n), dtype=np.float64)
+    idx = np.arange(n)
+    lap[idx, idx] = -2.0 / (dx * dx)
+    lap[idx, (idx + 1) % n] = 1.0 / (dx * dx)
+    lap[idx, (idx - 1) % n] = 1.0 / (dx * dx)
+
+    v_ext = (
+        -3.6 * np.exp(-0.5 * ((grid - 0.36 * dom_len) / 1.35) ** 2)
+        - 3.45 * np.exp(-0.5 * ((grid - 0.64 * dom_len) / 1.35) ** 2)
+        + 0.12 * np.cos(2.0 * np.pi * grid / dom_len)
+        + 0.04 * rng.standard_normal(n)
+    )
+    h0 = -0.5 * lap + np.diag(v_ext)
+    h0 = 0.5 * (h0 + h0.T)
+
+    diff = np.abs(grid[:, None] - grid[None, :])
+    per_dist = np.minimum(diff, dom_len - diff)
+    k_coul = np.exp(-0.28 * per_dist) / np.sqrt(per_dist * per_dist + 0.36)
+    k_coul = 0.5 * (k_coul + k_coul.T) + 1.0e-3 * np.eye(n)
+
+    n_elec = 5.0
+    alpha_h = 0.35
+    kb_t = 0.02
+    delta_fd = 1.0e-12
+    u_floor = 0.5 * delta_fd
+    log_u_floor = float(np.log(u_floor))
+
+    lower = np.zeros(p, dtype=np.float64)
+    upper = np.ones(p, dtype=np.float64)
+    lin_a = np.ones(p, dtype=np.float64)
+    lin_b = float(n_elec)
+
+    def _c2_xlogx(u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Exact u*ln(u) on u >= u_floor (all z in [0,1]) with C^2 extension if an external SQP step probes < -delta_FD/2."""
+        val = np.empty_like(u)
+        der = np.empty_like(u)
+        hi = u >= u_floor
+        if np.any(hi):
+            lu = np.log(u[hi])
+            val[hi] = u[hi] * lu
+            der[hi] = lu + 1.0
+        if np.any(~hi):
+            du = u[~hi] - u_floor
+            val[~hi] = u_floor * log_u_floor + (log_u_floor + 1.0) * du + 0.5 * (du * du) / u_floor
+            der[~hi] = (log_u_floor + 1.0) + du / u_floor
+        return val, der
+
+    def eval_fg(
+        z: np.ndarray, x_list: Sequence[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X = x_list[0]
+        if not (np.all(np.isfinite(z)) and np.all(np.isfinite(X))):
+            return (
+                float("nan"),
+                np.full(p, np.nan, dtype=np.float64),
+                [np.full((n, p), np.nan, dtype=np.float64, order="F")],
+            )
+
+        x_sq = X * X
+        rho = x_sq @ z
+        k_rho = k_coul @ rho
+
+        hx = h0 @ X
+        fx = hx + (alpha_h * k_rho)[:, None] * X
+
+        e_band = float(np.sum((X * hx) @ z))
+        e_hartree = 0.5 * alpha_h * float(rho @ k_rho)
+
+        u_occ = z + delta_fd
+        v_occ = (1.0 - z) + delta_fd
+        h_u, dh_u = _c2_xlogx(u_occ)
+        h_v, dh_v = _c2_xlogx(v_occ)
+        h_fd = float(np.sum(h_u + h_v))
+        dh_fd = dh_u - dh_v
+
+        f_val = e_band + e_hartree + kb_t * h_fd
+        gz = np.sum(X * fx, axis=0) + kb_t * dh_fd
+        gx = np.asfortranarray(2.0 * fx * z[None, :], dtype=np.float64)
+        return float(f_val), gz.astype(np.float64, copy=False), [gx]
+
+    return BenchmarkProblem(
+        problem_id="B8A",
+        name="Trace-Constrained Ensemble Kohn-Sham DFT",
+        regime_summary="z in [0,1]^12 (1^T z = 5) x St(120,12) (SLBQP + Branch A, hard trace)",
+        d=p,
+        lower=lower,
+        upper=upper,
+        n_list=(n,),
+        p_list=(p,),
+        eval_fg=eval_fg,
+        lin_a=lin_a,
+        lin_b=lin_b,
+        metadata={
+            "n_elec": n_elec,
+            "alpha_h": alpha_h,
+            "kb_t": kb_t,
+            "delta_fd": delta_fd,
+        },
+    )
+
+
+def _build_b8b_risk_factor_parity() -> BenchmarkProblem:
+    """B8B: Long-Only Weighted Orthogonal Risk-Factor Parity.
+
+    Domain: z in {z in [0, 0.15]^24 : a^T z = 1.0} x St(32, 6) x St(6, 6) (N_tot = 252 <= 450).
+    Tests general non-unit linear exposure weights a_i in [0.7, 1.4], active long-only
+    & concentration caps, and multi-factor Branch A + Branch B Stiefel coupling.
+    """
+    rng = np.random.Generator(np.random.PCG64(20260802))
+    d = 24
+    n1, p1 = 32, 6
+    n2, p2 = 6, 6
+    kappa_sigma = 500.0
+    lam_fac = 2.0
+    d_tgt_diag = np.array([0.30, 0.22, 0.16, 0.12, 0.08, 0.05], dtype=np.float64)
+    d_tgt = np.diag(d_tgt_diag)
+
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.full(d, 0.15, dtype=np.float64)
+    lin_a = 0.7 + 0.7 * np.arange(d, dtype=np.float64) / 23.0
+    lin_b = 1.0
+
+    u_sig = _random_orthonormal(rng, d, d, special_orthogonal=True)
+    sig_eigs = np.geomspace(0.02, 10.0, num=d).astype(np.float64)
+    sigma = (u_sig * sig_eigs[None, :]) @ u_sig.T
+    sigma = 0.5 * (sigma + sigma.T)
+
+    mu = 0.35 * rng.standard_normal(d)
+
+    u_m = _random_orthonormal(rng, n1, d)
+    v_m = _random_orthonormal(rng, d, d, special_orthogonal=True)
+    sv_m = np.geomspace(0.8, 3.2, num=d).astype(np.float64)
+    m_mat = (u_m * sv_m[None, :]) @ v_m.T
+
+    b_tgt = 0.25 * rng.standard_normal((n1, p1))
+    c_tgt = 0.5 * np.eye(p2, dtype=np.float64) + 0.15 * rng.standard_normal((p2, p2))
+    bc_tgt = b_tgt @ c_tgt
+
+    def eval_fg(
+        z: np.ndarray, x_list: Sequence[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X1, X2 = x_list[0], x_list[1]
+        if not (np.all(np.isfinite(z)) and np.all(np.isfinite(X1)) and np.all(np.isfinite(X2))):
+            return (
+                float("nan"),
+                np.full(d, np.nan, dtype=np.float64),
+                [
+                    np.full((n1, p1), np.nan, dtype=np.float64, order="F"),
+                    np.full((n2, p2), np.nan, dtype=np.float64, order="F"),
+                ],
+            )
+
+        u_mat = X1 @ X2
+        v_mat = m_mat.T @ u_mat
+        zv = z[:, None] * v_mat
+        e_mat = v_mat.T @ zv - d_tgt
+
+        sig_z = sigma @ z
+        f_val = (
+            0.5 * float(np.dot(z, sig_z))
+            - float(np.dot(mu, z))
+            + 0.5 * lam_fac * float(np.sum(e_mat * e_mat))
+            - float(np.sum(bc_tgt * u_mat))
+        )
+
+        ve = v_mat @ e_mat
+        diag_vevt = np.sum(v_mat * ve, axis=1)
+        gz = sig_z - mu + lam_fac * diag_vevt
+
+        grad_u = 2.0 * lam_fac * (m_mat @ (zv @ e_mat)) - bc_tgt
+        gx1 = np.asfortranarray(grad_u @ X2.T, dtype=np.float64)
+        gx2 = np.asfortranarray(X1.T @ grad_u, dtype=np.float64)
+        return float(f_val), gz.astype(np.float64, copy=False), [gx1, gx2]
+
+    return BenchmarkProblem(
+        problem_id="B8B",
+        name="Long-Only Weighted Orthogonal Risk-Factor Parity",
+        regime_summary="z in [0,0.15]^24 (a^T z = 1) x St(32,6) x St(6,6) (N_tot=252, Branch A & B)",
+        d=d,
+        lower=lower,
+        upper=upper,
+        n_list=(n1, n2),
+        p_list=(p1, p2),
+        eval_fg=eval_fg,
+        lin_a=lin_a,
+        lin_b=lin_b,
+        metadata={
+            "kappa_sigma": kappa_sigma,
+            "lambda_fac": lam_fac,
+            "d_tgt": d_tgt_diag.tolist(),
+        },
+    )
+
+
 _PROBLEM_BUILDERS: dict[str, Callable[[], BenchmarkProblem]] = {
     "B1": _build_b1_ensemble_dft,
     "B2A": _build_b2a_amplitude_limited_ica,
@@ -772,6 +990,8 @@ _PROBLEM_BUILDERS: dict[str, Callable[[], BenchmarkProblem]] = {
     "B6": _build_b6_ky_fan_brockett,
     "B7A": _build_b7a_pure_box_rosenbrock_quad,
     "B7B": _build_b7b_pure_stiefel_brockett_procrustes,
+    "B8A": _build_b8a_trace_constrained_dft,
+    "B8B": _build_b8b_risk_factor_parity,
 }
 
 _PROBLEM_CACHE: dict[str, BenchmarkProblem] = {}
@@ -790,5 +1010,8 @@ def get_benchmark_problem(problem_id: str) -> BenchmarkProblem:
 
 
 def get_all_benchmark_problems() -> list[BenchmarkProblem]:
-    """Return all 9 canonical benchmark instances in standard suite order."""
+    """Return all 11 canonical benchmark instances in standard suite order."""
     return [get_benchmark_problem(pid) for pid in BENCHMARK_IDS]
+
+
+ALL_PROBLEMS: tuple[BenchmarkProblem, ...] = tuple(get_all_benchmark_problems())

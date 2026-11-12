@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use fortchuck in your research or engineering systems, please cite it using the metadata below."
-title: "fortchuck: Zero-Allocation Coupled Box x Stiefel Product-Manifold Quasi-Newton Optimizer"
-version: 0.1.0
+title: "fortchuck: Zero-Allocation Coupled Box/Simplex x Stiefel Product-Manifold Quasi-Newton Optimizer"
+version: 0.2.0
 date-released: 2026-11-12
 authors:
   - family-names: "Cohen"
@@ -14,6 +14,7 @@ keywords:
   - stiefel-manifold
   - riemannian-optimization
   - box-constrained-optimization
+  - simplex-projection
   - l-bfgs
   - cayley-retraction
   - zero-allocation

@@ -1,10 +1,10 @@
 name = "fortchuck"
-version = "0.1.0"
+version = "0.2.0"
 license = "CC0-1.0"
 author = "Noah Cohen"
 maintainer = "Noah Cohen"
 copyright = "CC0-1.0 Universal Public Domain Dedication"
-description = "Zero-allocation, thread-safe Modern Fortran Coupled Box x Stiefel Quasi-Newton Optimizer"
+description = "Zero-allocation, thread-safe Modern Fortran Coupled Box/Simplex x Stiefel Quasi-Newton Optimizer"
 
 [library]
 source-dir = "src"
@@ -24,3 +24,8 @@ source-form = "free"
 [preprocess]
 [preprocess.cpp]
 suffixes = ["f90"]
+
+[[executable]]
+name = "fortchuck-bench"
+source-dir = "app"
+main = "fortchuck_bench.f90"

@@ -45,9 +45,10 @@ jobs:
           sudo apt-get install -y gfortran binutils libopenblas-dev
 
       - name: Set up Fortran Package Manager (fpm)
-        uses: fortran-lang/setup-fpm@v6
+        uses: fortran-lang/setup-fpm@v11
         with:
-          version: "0.13.0"
+          fpm-version: "v0.13.0"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Native Fortran 2018 Suite (Strict Sanitizers + 16-Thread OpenMP)
         env:

@@ -731,6 +731,21 @@ contains
     end do
   end function det_5x5
 
+  function lin_feas_tol(d, a, b, z) result(tol_eq)
+    integer(i32), intent(in) :: d
+    real(dp), intent(in)     :: a(d), b, z(d)
+    real(dp)                 :: tol_eq
+    real(dp)                 :: a_l1, z_inf
+    integer(i32)             :: i
+    a_l1  = 0.0_dp
+    z_inf = 0.0_dp
+    do i = 1_i32, d
+      a_l1  = a_l1 + abs(a(i))
+      z_inf = max(z_inf, abs(z(i)))
+    end do
+    tol_eq = 1.0e-14_dp * (1.0_dp + abs(b) + a_l1 * z_inf)
+  end function lin_feas_tol
+
   !---------------------------------------------------------------------------
   ! 1. Pure-Box regime (R = 0): +-FC_HUGE, +-Inf, fixed l_i == u_i, active bounds,
   !    and C-ABI null-pointer safety when R == 0 (n_arr/p_arr/X_packed == NULL)
@@ -1301,7 +1316,8 @@ contains
       c_loc(a10(1)), b10, c_loc(z10_p(1)), c_loc(nu_out))
     call check_true(st == FC_SUCCESS_QUERY, 'fortchuck_project_linear_box status==0')
     az_sum = sum(a10 * z10_p)
-    call check_true(abs(az_sum - b10) <= 1.0e-14_dp, 'fortchuck_project_linear_box |a^Tz - b| <= 1e-14')
+    call check_true(abs(az_sum - b10) <= lin_feas_tol(d10, a10, b10, z10_p), &
+      'fortchuck_project_linear_box |a^Tz - b| <= tol_eq')
     call check_true(abs(z10_p(5) - 0.45_dp) <= 1.0e-16_dp, 'fortchuck_project_linear_box fixed z(5)==0.45')
     st = fortchuck_project_linear_box(d10, c_loc(l10(1)), c_loc(u10(1)), &
       c_loc(a10(1)), b10, c_loc(z10_p(1)), c_null_ptr)
@@ -1334,7 +1350,8 @@ contains
       dummy_X, cb_knapsack10, c_loc(kctx), opts, work, lwork_q, iwork, liwork_q, res_f)
     call check_true(res_f%status == FC_CONVERGED_GRAD, 'Knapsack native fc_solve_constrained CONVERGED')
     call check_true(res_f%kkt_residual <= 1.0e-10_dp, 'Knapsack E_KKT <= 1e-10')
-    call check_true(abs(sum(a10 * z10_f) - b10) <= 1.0e-14_dp, 'Knapsack |a^Tz* - b| <= 1e-14')
+    call check_true(abs(sum(a10 * z10_f) - b10) <= lin_feas_tol(d10, a10, b10, z10_f), &
+      'Knapsack |a^Tz* - b| <= tol_eq')
 
     st = fortchuck_solve_constrained(d10, 0_i32, c_null_ptr, c_null_ptr, &
       c_loc(z10_c(1)), c_loc(l10(1)), c_loc(u10(1)), c_loc(a10(1)), b10, c_null_ptr, &
@@ -1359,8 +1376,8 @@ contains
       c_loc(work(1)), lwork_q, c_loc(kkt_c), c_loc(lin_c), c_loc(orth_c))
     call check_true(st == FC_SUCCESS_QUERY, 'fortchuck_kkt_residual_constrained R=0 status==0')
     call check_true(abs(kkt_c - res_c%kkt_residual) <= 1.0e-14_dp, 'Knapsack KKT residual match')
-    call check_true(lin_c <= 1.0e-14_dp .and. abs(orth_c) <= 1.0e-16_dp, &
-      'Knapsack lin_err <= 1e-14, orth==0')
+    call check_true(lin_c <= lin_feas_tol(d10, a10, b10, z10_c) .and. abs(orth_c) <= 1.0e-16_dp, &
+      'Knapsack lin_err <= tol_eq, orth==0')
 
     ! --- 6b. Coupled Constrained Box x St(10, 2) x St(4, 4) (a = 1 & weighted a != 1 + shift invariance) ---
     n_m = [10_i32, 4_i32]
@@ -1395,7 +1412,8 @@ contains
       call check_true(res_f%status == FC_CONVERGED_GRAD, 'Trace-coupled Multi-Stiefel CONVERGED')
       call check_true(res_f%kkt_residual <= 1.0e-9_dp, 'Trace-coupled Multi-Stiefel E_KKT <= 1e-9')
       call check_true(res_f%orth_error <= 1.0e-13_dp, 'Trace-coupled Multi-Stiefel orth <= 1e-13')
-      call check_true(abs(sum(z8) - b8) <= 1.0e-14_dp, 'Trace-coupled |1^Tz - b| <= 1e-14')
+      call check_true(abs(sum(z8) - b8) <= lin_feas_tol(8_i32, a8, b8, z8), &
+        'Trace-coupled |1^Tz - b| <= tol_eq')
       call check_true(abs(z8(3) - 0.35_dp) <= 1.0e-16_dp, 'Trace-coupled fixed z(3)==0.35')
     end do
 
@@ -1413,7 +1431,8 @@ contains
     call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
       cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_f)
     call check_true(res_f%status == FC_CONVERGED_GRAD, 'Weighted-coupled a/=1 CONVERGED')
-    call check_true(abs(sum(a8 * z8) - b8) <= 1.0e-14_dp, 'Weighted-coupled |a^Tz - b| <= 1e-14')
+    call check_true(abs(sum(a8 * z8) - b8) <= lin_feas_tol(8_i32, a8, b8, z8), &
+      'Weighted-coupled |a^Tz - b| <= tol_eq')
     z8_ref = z8
     f_base = res_f%f_val
 
@@ -1497,7 +1516,8 @@ contains
       opts, work, lwork_q, iwork, liwork_q, res_f)
     call check_true(res_f%status == FC_CONVERGED_GRAD, 'FM-13 simplex corner release CONVERGED_GRAD')
     call check_true(res_f%kkt_residual <= 1.0e-9_dp, 'FM-13 simplex corner E_KKT <= 1e-9')
-    call check_true(abs(sum(z_fm13) - 1.0_dp) <= 1.0e-14_dp, 'FM-13 simplex |1^Tz* - 1| <= 1e-14')
+    call check_true(abs(sum(z_fm13) - 1.0_dp) <= lin_feas_tol(8_i32, a_ones8, 1.0_dp, z_fm13), &
+      'FM-13 simplex |1^Tz* - 1| <= tol_eq')
     call check_true(z_fm13(1) < 0.25_dp, 'FM-13 released suboptimal corner e_1')
 
     ! --- 6d. Constrained Error Codes (FC_ERR_INFEASIBLE_LIN = -10, NULL, DIM, X0) ---

@@ -11,8 +11,8 @@ module fortchuck_lbfgs
   implicit none (type, external)
   private
 
-  real(dp), parameter :: GAMMA_MIN   = 1.0e-10_dp
-  real(dp), parameter :: GAMMA_MAX   = 1.0e+10_dp
+  real(dp), parameter :: GAMMA_MIN   = 1.0e-20_dp
+  real(dp), parameter :: GAMMA_MAX   = 1.0e+20_dp
   real(dp), parameter :: SAFE_SQ_LIM = 1.0e+153_dp
 
   public :: fc_lbfgs_apply_H
@@ -209,9 +209,9 @@ contains
         sig_tilde = box_sy
       end if
 
-      if (nu_s > 1.0e-60_dp .and. nu_y > 1.0e-60_dp .and. &
+      if (nu_s > 1.0e-100_dp .and. nu_y > 1.0e-100_dp .and. &
           ieee_is_finite(nu_s) .and. ieee_is_finite(nu_y) .and. &
-          ieee_is_finite(sig_tilde) .and. sig_tilde > 1.0e-60_dp) then
+          ieee_is_finite(sig_tilde) .and. sig_tilde > 1.0e-100_dp) then
         s_nrm = sqrt(nu_s)
         y_nrm = sqrt(nu_y)
         if (sig_tilde >= 1.0e-10_dp * s_nrm * y_nrm) then
@@ -630,7 +630,7 @@ contains
         end do
 
         if (.not. ieee_is_finite(dot_au) .or. .not. ieee_is_finite(dot_aw) .or. &
-            .not. (dot_aw > 1.0e-30_dp * ahat_free_sq)) then
+            .not. (dot_aw > (1.0e-12_dp * gam_box) * ahat_free_sq)) then
           fallback_spg = .true.
           return
         end if
@@ -771,10 +771,10 @@ contains
       ss_b   = abb_ss(1)
       sy_abs = abs(abb_sy(1))
       yy_b   = abb_yy(1)
-      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-30_dp .and. sy_abs > 1.0e-30_dp) then
+      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-100_dp .and. sy_abs > 1.0e-100_dp) then
         if (use_bb1) then
           alpha_box = safe_clipped_ratio(ss_b, sy_abs, GAMMA_MIN, GAMMA_MAX)
-        else if (yy_b > 1.0e-30_dp) then
+        else if (yy_b > 1.0e-100_dp) then
           alpha_box = safe_clipped_ratio(sy_abs, yy_b, GAMMA_MIN, GAMMA_MAX)
         else
           alpha_box = safe_clipped_ratio(1.0_dp, max(1.0_dp, g_box_nrm), GAMMA_MIN, GAMMA_MAX)
@@ -811,10 +811,10 @@ contains
       ss_b   = abb_ss(r_idx + 1_i32)
       sy_abs = abs(abb_sy(r_idx + 1_i32))
       yy_b   = abb_yy(r_idx + 1_i32)
-      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-30_dp .and. sy_abs > 1.0e-30_dp) then
+      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-100_dp .and. sy_abs > 1.0e-100_dp) then
         if (use_bb1) then
           alpha_r = safe_clipped_ratio(ss_b, sy_abs, GAMMA_MIN, GAMMA_MAX)
-        else if (yy_b > 1.0e-30_dp) then
+        else if (yy_b > 1.0e-100_dp) then
           alpha_r = safe_clipped_ratio(sy_abs, yy_b, GAMMA_MIN, GAMMA_MAX)
         else
           alpha_r = safe_clipped_ratio(1.0_dp, max(1.0_dp, g_st_nrm), GAMMA_MIN, GAMMA_MAX)
@@ -907,10 +907,10 @@ contains
       ss_b   = abb_ss(1)
       sy_abs = abs(abb_sy(1))
       yy_b   = abb_yy(1)
-      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-30_dp .and. sy_abs > 1.0e-30_dp) then
+      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-100_dp .and. sy_abs > 1.0e-100_dp) then
         if (use_bb1) then
           alpha_box = safe_clipped_ratio(ss_b, sy_abs, GAMMA_MIN, GAMMA_MAX)
-        else if (yy_b > 1.0e-30_dp) then
+        else if (yy_b > 1.0e-100_dp) then
           alpha_box = safe_clipped_ratio(sy_abs, yy_b, GAMMA_MIN, GAMMA_MAX)
         else
           alpha_box = safe_clipped_ratio(1.0_dp, max(1.0_dp, g_box_nrm), GAMMA_MIN, GAMMA_MAX)
@@ -981,10 +981,10 @@ contains
       ss_b   = abb_ss(r_idx + 1_i32)
       sy_abs = abs(abb_sy(r_idx + 1_i32))
       yy_b   = abb_yy(r_idx + 1_i32)
-      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-30_dp .and. sy_abs > 1.0e-30_dp) then
+      if (has_prev .and. k_iter > 0_i32 .and. ss_b > 1.0e-100_dp .and. sy_abs > 1.0e-100_dp) then
         if (use_bb1) then
           alpha_r = safe_clipped_ratio(ss_b, sy_abs, GAMMA_MIN, GAMMA_MAX)
-        else if (yy_b > 1.0e-30_dp) then
+        else if (yy_b > 1.0e-100_dp) then
           alpha_r = safe_clipped_ratio(sy_abs, yy_b, GAMMA_MIN, GAMMA_MAX)
         else
           alpha_r = safe_clipped_ratio(1.0_dp, max(1.0_dp, g_st_nrm), GAMMA_MIN, GAMMA_MAX)
@@ -1043,7 +1043,7 @@ contains
 
     integer(i32) :: ord, slot, i, j, idx, r_idx, nr, pr, np, p2
     integer(i32) :: m_eff, k_batch, panel_len, off_s, off_y, off_scur, off_rg
-    integer(i32) :: x_s, x_e, sk_s, sk_e, c_s, p_s, n_free_box
+    integer(i32) :: x_s, x_e, sk_s, sk_e, c_s, p_s
     real(dp)     :: one_minus_beta, acc_sy, acc_ss, acc_yy
     real(dp)     :: f_ss, f_sy, f_yy, a_ss, a_sy, a_yy
     real(dp)     :: box_free_ss, box_free_sy, box_free_yy
@@ -1051,12 +1051,13 @@ contains
     real(dp)     :: st_cur_ss, st_cur_sy, st_cur_yy
     real(dp)     :: clamped_box_ss, st_gnorm_sq, rg_frob_sq
     real(dp)     :: sig_ss, sig_sy, sig_yy
-    real(dp)     :: gam_box_new, d_min_next, d_max_next, si, yi, d_sec_i
-    real(dp)     :: s_avg_sq, d_prev_i
+    real(dp)     :: gam_box_new
     real(dp)     :: tot_free_ss, tot_free_sy, tot_free_yy
     real(dp)     :: norm_s_free, norm_y_free, thresh_cautious
     real(dp)     :: mu_k, omega_p, theta_k, inv_gam, inv_di
-    logical      :: do_push, did_damp, clamp_impulse, has_1d_curv, diag_step_ok
+    logical      :: do_push, did_damp, clamp_impulse
+
+    if (.false. .and. k_iter < 0_i32) continue
 
     if (metric == FC_METRIC_EUCLIDEAN) then
       one_minus_beta = 0.0_dp
@@ -1102,7 +1103,7 @@ contains
     if (d > 0_i32) then
       call accum_pair_stats(d, mask_box_new, s_cur, y_cur, &
         box_free_ss, box_free_sy, box_free_yy)
-      if (box_free_ss > 1.0e-60_dp) then
+      if (box_free_ss > 1.0e-100_dp) then
         abb_ss(1) = box_free_ss
         abb_sy(1) = box_free_sy
         abb_yy(1) = box_free_yy
@@ -1274,7 +1275,7 @@ contains
       sig_ss = abb_ss(r_idx)
       sig_sy = abb_sy(r_idx)
       sig_yy = abb_yy(r_idx)
-      if (sig_yy > 1.0e-30_dp .and. sig_ss > 1.0e-60_dp .and. &
+      if (sig_yy > 1.0e-100_dp .and. sig_ss > 1.0e-100_dp .and. &
           ieee_is_finite(sig_ss) .and. ieee_is_finite(sig_sy) .and. ieee_is_finite(sig_yy)) then
         if (sig_sy >= 1.0e-3_dp * (sqrt(sig_ss) * sqrt(sig_yy))) then
           gamma_blk(r_idx) = safe_clipped_ratio(sig_sy, sig_yy, GAMMA_MIN, GAMMA_MAX)
@@ -1282,57 +1283,13 @@ contains
       end if
     end do
 
-    ! 4b. Update persistent safeguarded coordinatewise diagonal preconditioner diag_box(1:d)
+    ! 4b. Keep box center preconditioner diag_box(1:d) on rotation-invariant BB2 scale
+    !     (avoids non-rotationally-invariant coordinatewise |s_i/y_i| distortion on
+    !      coupled / rotated Hessians while preserving exact workspace ABI layout).
     if (d > 0_i32) then
       gam_box_new = min(max(gamma_blk(1), GAMMA_MIN), GAMMA_MAX)
-      d_min_next  = max(GAMMA_MIN, 1.0e-3_dp * gam_box_new)
-      d_max_next  = max(d_min_next, min(GAMMA_MAX, 1.0e+3_dp * gam_box_new))
-
-      n_free_box = 0_i32
       do i = 1_i32, d
-        if (mask_box_new(i) == FC_BOX_FREE) n_free_box = n_free_box + 1_i32
-      end do
-
-      sig_ss       = abb_ss(1)
-      sig_sy       = abb_sy(1)
-      sig_yy       = abb_yy(1)
-      diag_step_ok = .false.
-      s_avg_sq     = 0.0_dp
-      if (sig_ss > 1.0e-60_dp .and. sig_yy > 1.0e-30_dp .and. &
-          ieee_is_finite(sig_ss) .and. ieee_is_finite(sig_sy) .and. ieee_is_finite(sig_yy)) then
-        if (sig_sy >= 1.0e-3_dp * (sqrt(sig_ss) * sqrt(sig_yy))) then
-          diag_step_ok = .true.
-          s_avg_sq     = sig_ss / real(max(1_i32, n_free_box), dp)
-        end if
-      end if
-
-      do i = 1_i32, d
-        si = s_cur(i)
-        yi = y_cur(i)
-        has_1d_curv = .false.
-        if (diag_step_ok .and. abs(si) > 1.0e-150_dp .and. abs(si) <= SAFE_SQ_LIM .and. &
-            abs(yi) > 1.0e-30_dp .and. abs(yi) <= SAFE_SQ_LIM) then
-          if (si * si >= 1.0e-2_dp * s_avg_sq .and. &
-              si * yi >= 1.0e-12_dp * (si * si)) then
-            has_1d_curv = .true.
-          end if
-        end if
-
-        if (has_1d_curv) then
-          d_sec_i = safe_clipped_ratio(abs(si), abs(yi), d_min_next, d_max_next)
-          if (k_iter <= 0_i32) then
-            diag_box(i) = d_sec_i
-          else
-            d_prev_i    = min(max(diag_box(i), d_min_next), d_max_next)
-            diag_box(i) = min(max(sqrt(d_prev_i * d_sec_i), d_min_next), d_max_next)
-          end if
-        else
-          if (k_iter <= 0_i32) then
-            diag_box(i) = gam_box_new
-          else
-            diag_box(i) = min(max(diag_box(i), d_min_next), d_max_next)
-          end if
-        end if
+        diag_box(i) = gam_box_new
       end do
     end if
 
@@ -1348,7 +1305,7 @@ contains
 
     norm_s_free = sqrt(tot_free_ss)
     norm_y_free = sqrt(tot_free_yy)
-    if (.not. (norm_s_free > 1.0e-30_dp)) return
+    if (.not. (norm_s_free > 1.0e-50_dp)) return
 
     do_push  = .false.
     did_damp = .false.
@@ -1368,7 +1325,7 @@ contains
         mu_k    = mu_k + inv_gam * abb_ss(r_idx + 1_i32)
       end do
 
-      if (mu_k > 1.0e-60_dp .and. ieee_is_finite(mu_k)) then
+      if (mu_k > 1.0e-100_dp .and. ieee_is_finite(mu_k)) then
         do_push = .true.
         if (tot_free_sy < omega_p * mu_k) then
           theta_k  = ((1.0_dp - omega_p) * mu_k) / (mu_k - tot_free_sy)
@@ -1380,7 +1337,7 @@ contains
       thresh_cautious = max( &
         1.0e-8_dp * tot_free_ss * min(1.0_dp, max(0.0_dp, kkt_old)), &
         1.0e-12_dp * norm_s_free * norm_y_free)
-      if (tot_free_sy >= thresh_cautious .and. tot_free_sy > 1.0e-60_dp) then
+      if (tot_free_sy >= thresh_cautious .and. tot_free_sy > 1.0e-100_dp) then
         do_push = .true.
       end if
     end if

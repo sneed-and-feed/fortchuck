@@ -9,9 +9,9 @@ Provides:
      wall-clock timeout budgets while avoiding double-counting when external
      optimizers invoke separate `cost(x)` and `grad(x)` callbacks at one point.
   4. Deterministic `PCG64` feasible `(z0, X0_list)` initialization generator
-     supporting primary (`101..110`), holdout (`201..210`), and untouched third
-     blind holdout (`301..310`) seed suites while preserving exact `v0.1.0` draws
-     on `B1..B7B`.
+     supporting primary (`101..110`), holdout (`201..210`), third blind holdout
+     (`301..310`), and virgin fourth blind holdout (`401..410`) seed suites while
+     preserving exact `v0.1.0` draws on `B1..B7B`.
   5. Full coordinatewise central finite-difference gradient verifier (`<= 1e-7`).
 """
 
@@ -34,6 +34,7 @@ DEFAULT_SEEDS: tuple[int, ...] = tuple(range(101, 111))
 PRIMARY_SEEDS: tuple[int, ...] = DEFAULT_SEEDS
 HOLDOUT_SEEDS: tuple[int, ...] = tuple(range(201, 211))
 BLIND3_SEEDS: tuple[int, ...] = tuple(range(301, 311))
+BLIND4_SEEDS: tuple[int, ...] = tuple(range(401, 411))
 
 
 class BudgetExhaustedError(RuntimeError):
@@ -812,7 +813,7 @@ def _cli_main() -> int:
         "--seeds",
         type=str,
         default="101..110",
-        help="Seed range/list (e.g., '101..110', '201..210', or '301..310').",
+        help="Seed range/list (e.g., '101..110', '201..210', '301..310', or '401..410').",
     )
     parser.add_argument(
         "--all-seed-gradients",

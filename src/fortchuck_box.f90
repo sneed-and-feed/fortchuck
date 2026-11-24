@@ -7,8 +7,8 @@ module fortchuck_box
   implicit none (type, external)
   private
 
-  real(dp), parameter :: GAMMA_MIN   = 1.0e-10_dp
-  real(dp), parameter :: GAMMA_MAX   = 1.0e+10_dp
+  real(dp), parameter :: GAMMA_MIN   = 1.0e-20_dp
+  real(dp), parameter :: GAMMA_MAX   = 1.0e+20_dp
   real(dp), parameter :: SAFE_SQ_LIM = 1.0e+153_dp
 
   public :: fc_box_validate
@@ -23,6 +23,7 @@ module fortchuck_box
   public :: fc_box_lin_validate
   public :: fc_box_lin_project
   public :: fc_box_lin_kkt_residual
+  public :: fc_box_lin_kkt_inf
   public :: fc_box_lin_partition
   public :: fc_box_lin_trial_step
 
@@ -200,7 +201,7 @@ contains
     real(dp), intent(out)    :: box_inf, box_l2
 
     integer(i32) :: i
-    real(dp)     :: proj, ri, absri, scale, ssq, ratio, half_diff
+    real(dp)     :: proj, ri, absri, scale, ssq, ratio, half_diff, gap
 
     box_inf = 0.0_dp
     box_l2  = 0.0_dp
@@ -210,17 +211,36 @@ contains
     ssq   = 1.0_dp
 
     do i = 1_i32, d
-      proj = safe_clamp_step(z(i), l(i), u(i), -gz(i), 1.0_dp)
-      if (abs(z(i)) <= 0.45_dp * FC_HUGE .and. abs(proj) <= 0.45_dp * FC_HUGE) then
-        ri = z(i) - proj
-      else
-        half_diff = 0.5_dp * z(i) - 0.5_dp * proj
-        if (half_diff >= 0.5_dp * FC_HUGE) then
-          ri = FC_HUGE
-        else if (half_diff <= -0.5_dp * FC_HUGE) then
-          ri = -FC_HUGE
+      if (z(i) >= l(i) .and. z(i) <= u(i)) then
+        ! Cancellation-free exact projected gradient for feasible z(i) in [l(i), u(i)]
+        if (gz(i) >= 0.0_dp) then
+          if (ieee_is_finite(l(i))) then
+            gap = safe_sub_dp(z(i), l(i))
+            ri  = min(gz(i), max(0.0_dp, gap))
+          else
+            ri  = gz(i)
+          end if
         else
+          if (ieee_is_finite(u(i))) then
+            gap = safe_sub_dp(z(i), u(i))
+            ri  = max(gz(i), min(0.0_dp, gap))
+          else
+            ri  = gz(i)
+          end if
+        end if
+      else
+        proj = safe_clamp_step(z(i), l(i), u(i), -gz(i), 1.0_dp)
+        if (abs(z(i)) <= 0.45_dp * FC_HUGE .and. abs(proj) <= 0.45_dp * FC_HUGE) then
           ri = z(i) - proj
+        else
+          half_diff = 0.5_dp * z(i) - 0.5_dp * proj
+          if (half_diff >= 0.5_dp * FC_HUGE) then
+            ri = FC_HUGE
+          else if (half_diff <= -0.5_dp * FC_HUGE) then
+            ri = -FC_HUGE
+          else
+            ri = z(i) - proj
+          end if
         end if
       end if
 
@@ -664,9 +684,15 @@ contains
           si = s_prev(i)
           yi = y_prev(i)
           if (abs(si) > 1.0e-150_dp .and. abs(si) <= SAFE_SQ_LIM .and. &
-              abs(yi) > 1.0e-30_dp  .and. abs(yi) <= SAFE_SQ_LIM) then
-            if (si * yi >= 1.0e-12_dp * (si * si)) then
-              gamma_act = min(max(si / yi, lo_eff), hi_eff)
+              abs(yi) > 1.0e-100_dp .and. abs(yi) <= SAFE_SQ_LIM) then
+            if ((si > 0.0_dp .and. yi > 0.0_dp) .or. (si < 0.0_dp .and. yi < 0.0_dp)) then
+              if (abs(yi) >= 1.0_dp) then
+                gamma_act = min(max(abs(si) / abs(yi), lo_eff), hi_eff)
+              else if (abs(si) >= hi_eff * abs(yi)) then
+                gamma_act = hi_eff
+              else
+                gamma_act = max(lo_eff, abs(si) / abs(yi))
+              end if
             end if
           end if
         end if
@@ -958,7 +984,7 @@ contains
       az_term = 0.2_dp * FC_HUGE
     end if
 
-    tol_hat = 1.0e-14_dp * base_hat_tol + 1.0e-14_dp * az_term
+    tol_hat = (4.0_dp * FC_EPS) * base_hat_tol + (4.0_dp * FC_EPS) * az_term
     is_conv = (abs(psi_hat) <= tol_hat)
   end subroutine eval_psi_pass
 
@@ -1510,9 +1536,413 @@ contains
   end subroutine fc_box_lin_project
 
   !---------------------------------------------------------------------------
+  ! Overflow-safe ratio min(0.45*FC_HUGE, num / den) for num >= 0, den > 0.
+  !---------------------------------------------------------------------------
+  pure function safe_pos_div_cap(num, den) result(q)
+    real(dp), intent(in) :: num, den
+    real(dp)             :: q
+
+    if (.not. (num > 0.0_dp) .or. .not. (den > 0.0_dp)) then
+      q = 0.0_dp
+    else if (den >= 1.0_dp) then
+      q = min(0.45_dp * FC_HUGE, num / den)
+    else if (num >= 0.45_dp * FC_HUGE * den) then
+      q = 0.45_dp * FC_HUGE
+    else
+      q = num / den
+    end if
+  end function safe_pos_div_cap
+
+  !---------------------------------------------------------------------------
+  ! Evaluate scaled delta-space projection residual for z in C and ||gz||_inf = g_scale:
+  !   psi(nu_hat) = sum_{a_i /= 0} a_hat_i * P_{[(l_i-z_i)/g_scale, (u_i-z_i)/g_scale]}(-gz_i/g_scale - nu_hat*a_hat_i)
+  ! Zero array allocation; preserves all 53 bits of gz even when ||gz|| << ||z||.
+  !---------------------------------------------------------------------------
+  pure subroutine eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+      nu_hat, psi_hat, dpsi_hat, is_conv)
+    integer(i32), intent(in) :: d
+    real(dp), intent(in)     :: z(*), l(*), u(*), a(*), gz(*)
+    real(dp), intent(in)     :: alpha_max, a_hat_l1, g_scale, nu_hat
+    real(dp), intent(out)    :: psi_hat, dpsi_hat
+    logical, intent(out)     :: is_conv
+
+    integer(i32) :: i
+    real(dp)     :: ai, a_hat_i, yi, li_d, ui_d, wi
+    real(dp)     :: s_psi, c_psi, w_inf, aw_term, tol_hat
+    logical      :: is_free
+
+    s_psi    = 0.0_dp
+    c_psi    = 0.0_dp
+    dpsi_hat = 0.0_dp
+    w_inf    = 0.0_dp
+
+    do i = 1_i32, d
+      ai = a(i)
+      if (abs(ai) > 0.0_dp) then
+        a_hat_i = ai / alpha_max
+        yi      = -gz(i) / g_scale
+        if (.not. (l(i) < u(i))) then
+          li_d = 0.0_dp
+          ui_d = 0.0_dp
+        else
+          if (ieee_is_finite(l(i))) then
+            li_d = -safe_pos_div_cap(max(0.0_dp, safe_sub_dp(z(i), l(i))), g_scale)
+          else
+            li_d = -FC_HUGE
+          end if
+          if (ieee_is_finite(u(i))) then
+            ui_d = safe_pos_div_cap(max(0.0_dp, safe_sub_dp(u(i), z(i))), g_scale)
+          else
+            ui_d = FC_HUGE
+          end if
+        end if
+        call clamp_shifted_coord(yi, li_d, ui_d, a_hat_i, nu_hat, wi, is_free)
+        call neumaier_add_safe(s_psi, c_psi, a_hat_i * wi)
+        if (is_free) then
+          dpsi_hat = dpsi_hat - a_hat_i * a_hat_i
+        end if
+        if (abs(wi) > w_inf) w_inf = abs(wi)
+      end if
+    end do
+
+    psi_hat = neumaier_finalize_safe(s_psi, c_psi)
+    if (w_inf <= 1.0_dp .or. a_hat_l1 <= 0.2_dp * FC_HUGE / w_inf) then
+      aw_term = a_hat_l1 * max(1.0_dp, w_inf)
+    else
+      aw_term = 0.2_dp * FC_HUGE
+    end if
+    tol_hat = (4.0_dp * FC_EPS) * max(1.0_dp, aw_term)
+    is_conv = (abs(psi_hat) <= tol_hat)
+  end subroutine eval_delta_psi_pass
+
+  !---------------------------------------------------------------------------
+  ! Cancellation-free delta-space projection delta = P_{C - z}(-gz) for feasible z in C
+  ! when 0 < ||gz||_inf << max(1, ||z||_inf) (e.g., objective rescaled by 1e-14).
+  !---------------------------------------------------------------------------
+  pure subroutine solve_delta_lin_proj(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+      delta_out, nu_out)
+    integer(i32), intent(in) :: d
+    real(dp), intent(in)     :: z(*), l(*), u(*), a(*), gz(*)
+    real(dp), intent(in)     :: alpha_max, a_hat_l1, g_scale
+    real(dp), intent(out)    :: delta_out(*), nu_out
+
+    integer(i32), parameter :: MAX_PASSES = 60_i32
+    integer(i32) :: i, n_passes
+    real(dp)     :: ai, a_hat_i, yi, li_d, ui_d, wi, brk_val
+    real(dp)     :: nu_0, psi_0, dpsi_0, nu_1, psi_1, dpsi_1
+    real(dp)     :: nu_lo, psi_lo, dpsi_lo, nu_hi, psi_hi, dpsi_hi
+    real(dp)     :: nu_cur, psi_cur, dpsi_cur, abs_psi_prev
+    real(dp)     :: nu_best, abs_psi_best, nu_try, psi_try, dpsi_try
+    real(dp)     :: delta_step, step_n, half_w, width, nu_next, sec_frac, nu_unsc
+    logical      :: is_free, is_conv, has_lo, has_hi, have_newton
+    logical      :: can_go_neg, can_go_pos, have_sing
+
+    ! Check if z sits on a singleton boundary face (a^T delta == 0 forces delta_i == 0 for a_i /= 0)
+    can_go_neg = .false.
+    can_go_pos = .false.
+    do i = 1_i32, d
+      ai = a(i)
+      if (abs(ai) > 0.0_dp .and. (l(i) < u(i))) then
+        if (ai > 0.0_dp) then
+          if (.not. ieee_is_finite(l(i)) .or. safe_sub_dp(z(i), l(i)) > 0.0_dp) can_go_neg = .true.
+          if (.not. ieee_is_finite(u(i)) .or. safe_sub_dp(u(i), z(i)) > 0.0_dp) can_go_pos = .true.
+        else
+          if (.not. ieee_is_finite(u(i)) .or. safe_sub_dp(u(i), z(i)) > 0.0_dp) can_go_neg = .true.
+          if (.not. ieee_is_finite(l(i)) .or. safe_sub_dp(z(i), l(i)) > 0.0_dp) can_go_pos = .true.
+        end if
+      end if
+    end do
+
+    if (.not. can_go_neg .or. .not. can_go_pos) then
+      nu_best   = 0.0_dp
+      have_sing = .false.
+      do i = 1_i32, d
+        ai = a(i)
+        if (abs(ai) > 0.0_dp) then
+          delta_out(i) = 0.0_dp
+          if (l(i) < u(i)) then
+            a_hat_i = ai / alpha_max
+            yi      = -gz(i) / g_scale
+            if (abs(yi) < 0.2_dp * FC_HUGE * abs(a_hat_i)) then
+              brk_val = yi / a_hat_i
+              if (.not. can_go_neg) then
+                if (.not. have_sing .or. brk_val > nu_best) then
+                  nu_best   = brk_val
+                  have_sing = .true.
+                end if
+              else
+                if (.not. have_sing .or. brk_val < nu_best) then
+                  nu_best   = brk_val
+                  have_sing = .true.
+                end if
+              end if
+            end if
+          end if
+        else
+          if (.not. (l(i) < u(i))) then
+            delta_out(i) = 0.0_dp
+          else if (gz(i) >= 0.0_dp) then
+            if (ieee_is_finite(l(i))) then
+              delta_out(i) = -min(gz(i), max(0.0_dp, safe_sub_dp(z(i), l(i))))
+            else
+              delta_out(i) = -gz(i)
+            end if
+          else
+            if (ieee_is_finite(u(i))) then
+              delta_out(i) = -max(gz(i), min(0.0_dp, safe_sub_dp(z(i), u(i))))
+            else
+              delta_out(i) = -gz(i)
+            end if
+          end if
+        end if
+      end do
+      nu_unsc = unscale_nu_safe(nu_best, alpha_max)
+      if (abs(nu_unsc) <= 1.0_dp .or. g_scale <= 0.45_dp * FC_HUGE / abs(nu_unsc)) then
+        nu_out = nu_unsc * g_scale
+      else
+        nu_out = sign(0.45_dp * FC_HUGE, nu_unsc)
+      end if
+      return
+    end if
+
+    nu_0     = 0.0_dp
+    n_passes = 1_i32
+    call eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+      nu_0, psi_0, dpsi_0, is_conv)
+    if (is_conv) then
+      nu_best = nu_0
+    else
+      nu_best      = nu_0
+      abs_psi_best = abs(psi_0)
+      has_lo       = .false.
+      has_hi       = .false.
+      nu_lo        = 0.0_dp; psi_lo = 0.0_dp; dpsi_lo = 0.0_dp
+      nu_hi        = 0.0_dp; psi_hi = 0.0_dp; dpsi_hi = 0.0_dp
+
+      if (psi_0 > 0.0_dp) then
+        has_lo = .true.; nu_lo = nu_0; psi_lo = psi_0; dpsi_lo = dpsi_0
+      else
+        has_hi = .true.; nu_hi = nu_0; psi_hi = psi_0; dpsi_hi = dpsi_0
+      end if
+
+      if (dpsi_0 < -1.0e-30_dp .and. safe_can_div(psi_0, dpsi_0, 0.2_dp)) then
+        nu_1 = -psi_0 / dpsi_0
+      else
+        nu_1 = sign(1.0_dp, psi_0)
+      end if
+
+      n_passes = n_passes + 1_i32
+      call eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+        nu_1, psi_1, dpsi_1, is_conv)
+      if (abs(psi_1) < abs_psi_best) then
+        nu_best      = nu_1
+        abs_psi_best = abs(psi_1)
+      end if
+
+      if (.not. is_conv) then
+        if (psi_1 > 0.0_dp) then
+          if (.not. has_lo .or. nu_1 > nu_lo) then
+            has_lo = .true.; nu_lo = nu_1; psi_lo = psi_1; dpsi_lo = dpsi_1
+          end if
+        else
+          if (.not. has_hi .or. nu_1 < nu_hi) then
+            has_hi = .true.; nu_hi = nu_1; psi_hi = psi_1; dpsi_hi = dpsi_1
+          end if
+        end if
+
+        if (.not. has_lo) then
+          delta_step = max(1.0_dp, abs(nu_hi))
+          do while (.not. has_lo .and. .not. is_conv .and. n_passes < 16_i32)
+            if (dpsi_hi < -1.0e-30_dp .and. safe_can_div(psi_hi, dpsi_hi, 0.1_dp)) then
+              step_n = 2.0_dp * abs(psi_hi / dpsi_hi)
+              if (step_n > delta_step) delta_step = step_n
+            end if
+            if (nu_hi <= -0.45_dp * FC_HUGE + delta_step) then
+              nu_try = -0.45_dp * FC_HUGE
+            else
+              nu_try = nu_hi - delta_step
+            end if
+            n_passes = n_passes + 1_i32
+            call eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+              nu_try, psi_try, dpsi_try, is_conv)
+            if (abs(psi_try) < abs_psi_best) then
+              nu_best      = nu_try
+              abs_psi_best = abs(psi_try)
+            end if
+            if (psi_try >= 0.0_dp) then
+              has_lo = .true.; nu_lo = nu_try; psi_lo = psi_try; dpsi_lo = dpsi_try
+            else
+              nu_hi = nu_try; psi_hi = psi_try; dpsi_hi = dpsi_try
+              if (delta_step < 0.02_dp * FC_HUGE) then
+                delta_step = 16.0_dp * delta_step
+              else
+                delta_step = 0.45_dp * FC_HUGE
+              end if
+              if (.not. (nu_try > -0.45_dp * FC_HUGE)) exit
+            end if
+          end do
+        end if
+
+        if (.not. is_conv .and. .not. has_hi) then
+          delta_step = max(1.0_dp, abs(nu_lo))
+          do while (.not. has_hi .and. .not. is_conv .and. n_passes < 16_i32)
+            if (dpsi_lo < -1.0e-30_dp .and. safe_can_div(psi_lo, dpsi_lo, 0.1_dp)) then
+              step_n = 2.0_dp * abs(psi_lo / dpsi_lo)
+              if (step_n > delta_step) delta_step = step_n
+            end if
+            if (nu_lo >= 0.45_dp * FC_HUGE - delta_step) then
+              nu_try = 0.45_dp * FC_HUGE
+            else
+              nu_try = nu_lo + delta_step
+            end if
+            n_passes = n_passes + 1_i32
+            call eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+              nu_try, psi_try, dpsi_try, is_conv)
+            if (abs(psi_try) < abs_psi_best) then
+              nu_best      = nu_try
+              abs_psi_best = abs(psi_try)
+            end if
+            if (psi_try <= 0.0_dp) then
+              has_hi = .true.; nu_hi = nu_try; psi_hi = psi_try; dpsi_hi = dpsi_try
+            else
+              nu_lo = nu_try; psi_lo = psi_try; dpsi_lo = dpsi_try
+              if (delta_step < 0.02_dp * FC_HUGE) then
+                delta_step = 16.0_dp * delta_step
+              else
+                delta_step = 0.45_dp * FC_HUGE
+              end if
+              if (.not. (nu_try < 0.45_dp * FC_HUGE)) exit
+            end if
+          end do
+        end if
+
+        if (.not. is_conv .and. has_lo .and. has_hi) then
+          if (abs(psi_lo) <= abs(psi_hi)) then
+            nu_cur = nu_lo; psi_cur = psi_lo; dpsi_cur = dpsi_lo
+          else
+            nu_cur = nu_hi; psi_cur = psi_hi; dpsi_cur = dpsi_hi
+          end if
+          abs_psi_prev = max(abs(psi_lo), abs(psi_hi))
+
+          do while (.not. is_conv .and. n_passes < MAX_PASSES)
+            half_w = 0.5_dp * nu_hi - 0.5_dp * nu_lo
+            if (half_w <= FC_EPS * (1.0_dp + min(abs(nu_lo), 0.2_dp * FC_HUGE) + &
+                                             min(abs(nu_hi), 0.2_dp * FC_HUGE))) then
+              exit
+            end if
+
+            if (abs(psi_cur) <= 0.5_dp * abs_psi_prev) then
+              have_newton = .false.
+              nu_next     = 0.5_dp * nu_lo + 0.5_dp * nu_hi
+              if (dpsi_cur < -1.0e-30_dp .and. safe_can_div(psi_cur, dpsi_cur, 0.2_dp)) then
+                nu_next     = safe_sub_dp(nu_cur, psi_cur / dpsi_cur)
+                have_newton = (nu_next > nu_lo .and. nu_next < nu_hi)
+              end if
+              if (.not. have_newton) then
+                if (half_w < 0.45_dp * FC_HUGE .and. &
+                    safe_sub_dp(psi_lo, psi_hi) > 1.0e-60_dp) then
+                  width    = 2.0_dp * half_w
+                  sec_frac = min(max(psi_lo / safe_sub_dp(psi_lo, psi_hi), 0.05_dp), 0.95_dp)
+                  nu_next  = nu_lo + sec_frac * width
+                else
+                  nu_next = 0.5_dp * nu_lo + 0.5_dp * nu_hi
+                end if
+              end if
+            else
+              nu_next = 0.5_dp * nu_lo + 0.5_dp * nu_hi
+            end if
+
+            if (.not. (nu_next > nu_lo .and. nu_next < nu_hi)) then
+              nu_next = 0.5_dp * nu_lo + 0.5_dp * nu_hi
+              if (.not. (nu_next > nu_lo .and. nu_next < nu_hi)) exit
+            end if
+
+            n_passes = n_passes + 1_i32
+            call eval_delta_psi_pass(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_scale, &
+              nu_next, psi_try, dpsi_try, is_conv)
+            if (abs(psi_try) < abs_psi_best) then
+              nu_best      = nu_next
+              abs_psi_best = abs(psi_try)
+            end if
+
+            if (psi_try > 0.0_dp) then
+              nu_lo = nu_next; psi_lo = psi_try; dpsi_lo = dpsi_try
+            else if (psi_try < 0.0_dp) then
+              nu_hi = nu_next; psi_hi = psi_try; dpsi_hi = dpsi_try
+            else
+              nu_best = nu_next
+              exit
+            end if
+
+            abs_psi_prev = abs(psi_cur)
+            nu_cur       = nu_next
+            psi_cur      = psi_try
+            dpsi_cur     = dpsi_try
+          end do
+        end if
+      end if
+    end if
+
+    ! Materialize unscaled delta_out(i) = g_scale * wi
+    do i = 1_i32, d
+      ai = a(i)
+      if (abs(ai) > 0.0_dp) then
+        a_hat_i = ai / alpha_max
+        yi      = -gz(i) / g_scale
+        if (.not. (l(i) < u(i))) then
+          li_d = 0.0_dp
+          ui_d = 0.0_dp
+        else
+          if (ieee_is_finite(l(i))) then
+            li_d = -safe_pos_div_cap(max(0.0_dp, safe_sub_dp(z(i), l(i))), g_scale)
+          else
+            li_d = -FC_HUGE
+          end if
+          if (ieee_is_finite(u(i))) then
+            ui_d = safe_pos_div_cap(max(0.0_dp, safe_sub_dp(u(i), z(i))), g_scale)
+          else
+            ui_d = FC_HUGE
+          end if
+        end if
+        call clamp_shifted_coord(yi, li_d, ui_d, a_hat_i, nu_best, wi, is_free)
+        if (abs(wi) <= 1.0_dp .or. g_scale <= 0.45_dp * FC_HUGE / abs(wi)) then
+          delta_out(i) = wi * g_scale
+        else
+          delta_out(i) = sign(0.45_dp * FC_HUGE, wi)
+        end if
+      else
+        if (.not. (l(i) < u(i))) then
+          delta_out(i) = 0.0_dp
+        else if (gz(i) >= 0.0_dp) then
+          if (ieee_is_finite(l(i))) then
+            delta_out(i) = -min(gz(i), max(0.0_dp, safe_sub_dp(z(i), l(i))))
+          else
+            delta_out(i) = -gz(i)
+          end if
+        else
+          if (ieee_is_finite(u(i))) then
+            delta_out(i) = -max(gz(i), min(0.0_dp, safe_sub_dp(z(i), u(i))))
+          else
+            delta_out(i) = -gz(i)
+          end if
+        end if
+      end if
+    end do
+
+    nu_unsc = unscale_nu_safe(nu_best, alpha_max)
+    if (abs(nu_unsc) <= 1.0_dp .or. g_scale <= 0.45_dp * FC_HUGE / abs(nu_unsc)) then
+      nu_out = nu_unsc * g_scale
+    else
+      nu_out = sign(0.45_dp * FC_HUGE, nu_unsc)
+    end if
+  end subroutine solve_delta_lin_proj
+
+  !---------------------------------------------------------------------------
   ! Continuous 1-Lipschitz constrained KKT residual on {z in [l,u]^d : a^T z = b}:
   !   z_proj_tmp = P_C(z - gz), rbox = z - z_proj_tmp, box_inf = ||rbox||_inf,
   !   box_l2 = ||rbox||_2, and multiplier estimate nu_out.
+  ! Uses cancellation-free scaled delta-space projection when z in C and
+  ! 0 < ||gz||_inf << max(1, ||z||_inf) to preserve full 53-bit KKT accuracy.
   !---------------------------------------------------------------------------
   pure subroutine fc_box_lin_kkt_residual(d, z, l, u, a, b, gz, &
       z_proj_tmp, rbox, nu_out, box_inf, box_l2, status)
@@ -1525,6 +1955,9 @@ contains
 
     integer(i32) :: i
     real(dp)     :: ri, absri, scale, ssq, ratio
+    real(dp)     :: g_max, z_inf, alpha_max, a_hat_l1, b_hat, b_hat_min, b_hat_max, tau_hat_feas
+    real(dp)     :: s_lin, c_lin, a_hat_i, base_tol, az_term, lin_hat_err
+    logical      :: has_unb_lo, has_unb_hi, z_box_feas, use_delta
 
     nu_out  = 0.0_dp
     box_inf = 0.0_dp
@@ -1536,12 +1969,76 @@ contains
       return
     end if
 
+    g_max      = 0.0_dp
+    z_inf      = 0.0_dp
+    z_box_feas = .true.
     do i = 1_i32, d
       if (ieee_is_nan(z(i)) .or. ieee_is_nan(gz(i)) .or. &
           .not. ieee_is_finite(z(i)) .or. .not. ieee_is_finite(gz(i))) then
         status = FC_ERR_INFEASIBLE_LIN
         return
       end if
+      if (abs(gz(i)) > g_max) g_max = abs(gz(i))
+      if (abs(z(i)) > z_inf)  z_inf = abs(z(i))
+      if (z(i) < l(i) .or. z(i) > u(i)) z_box_feas = .false.
+    end do
+
+    use_delta = .false.
+    if (z_box_feas .and. g_max > 1.0e-250_dp .and. g_max < 1.0e-4_dp * max(1.0_dp, z_inf)) then
+      call analyze_lin_box(d, l, u, a, b, alpha_max, a_hat_l1, b_hat, &
+        b_hat_min, b_hat_max, tau_hat_feas, has_unb_lo, has_unb_hi, status)
+      if (status /= 0_i32) return
+
+      s_lin = 0.0_dp
+      c_lin = 0.0_dp
+      do i = 1_i32, d
+        if (abs(a(i)) > 0.0_dp) then
+          a_hat_i = a(i) / alpha_max
+          call neumaier_add_safe(s_lin, c_lin, a_hat_i * z(i))
+        end if
+      end do
+      call neumaier_add_safe(s_lin, c_lin, -b_hat)
+      lin_hat_err = abs(neumaier_finalize_safe(s_lin, c_lin))
+
+      base_tol = min(0.2_dp * FC_HUGE, safe_pos_div_cap(1.0_dp, alpha_max)) + &
+                 min(0.2_dp * FC_HUGE, abs(b_hat))
+      if (z_inf <= 1.0_dp .or. a_hat_l1 <= 0.2_dp * FC_HUGE / z_inf) then
+        az_term = a_hat_l1 * z_inf
+      else
+        az_term = 0.2_dp * FC_HUGE
+      end if
+      if (lin_hat_err <= (8.0_dp * FC_EPS) * (base_tol + az_term)) then
+        use_delta = .true.
+      end if
+    end if
+
+    if (use_delta) then
+      call solve_delta_lin_proj(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_max, &
+        rbox, nu_out)
+      scale = 0.0_dp
+      ssq   = 1.0_dp
+      do i = 1_i32, d
+        z_proj_tmp(i) = min(max(safe_sub_dp(z(i), -rbox(i)), l(i)), u(i))
+        ri            = -rbox(i)
+        rbox(i)       = ri
+        absri         = abs(ri)
+        if (absri > box_inf) box_inf = absri
+        if (absri > 0.0_dp) then
+          if (scale < absri) then
+            ratio = scale / absri
+            ssq   = 1.0_dp + ssq * (ratio * ratio)
+            scale = absri
+          else
+            ratio = absri / scale
+            ssq   = ssq + ratio * ratio
+          end if
+        end if
+      end do
+      box_l2 = scale * sqrt(ssq)
+      return
+    end if
+
+    do i = 1_i32, d
       z_proj_tmp(i) = safe_sub_dp(z(i), gz(i))
     end do
 
@@ -1570,6 +2067,96 @@ contains
 
     box_l2 = scale * sqrt(ssq)
   end subroutine fc_box_lin_kkt_residual
+
+  !---------------------------------------------------------------------------
+  ! Single-workspace (length d) cancellation-free inf-norm KKT residual
+  ! ||z - P_C(z - gz)||_inf for standalone fc_kkt_residual_constrained.
+  !---------------------------------------------------------------------------
+  pure subroutine fc_box_lin_kkt_inf(d, z, l, u, a, b, gz, work_d, box_inf, status)
+    integer(i32), intent(in)  :: d
+    real(dp), intent(in)      :: z(*), l(*), u(*), a(*), gz(*)
+    real(dp), intent(in)      :: b
+    real(dp), intent(out)     :: work_d(*)
+    real(dp), intent(out)     :: box_inf
+    integer(i32), intent(out) :: status
+
+    integer(i32) :: i
+    real(dp)     :: ri_abs, nu_tmp
+    real(dp)     :: g_max, z_inf, alpha_max, a_hat_l1, b_hat, b_hat_min, b_hat_max, tau_hat_feas
+    real(dp)     :: s_lin, c_lin, a_hat_i, base_tol, az_term, lin_hat_err
+    logical      :: has_unb_lo, has_unb_hi, z_box_feas, use_delta
+
+    box_inf = 0.0_dp
+    status  = 0_i32
+    if (d < 1_i32) then
+      status = FC_ERR_INVALID_DIM
+      return
+    end if
+
+    g_max      = 0.0_dp
+    z_inf      = 0.0_dp
+    z_box_feas = .true.
+    do i = 1_i32, d
+      if (ieee_is_nan(z(i)) .or. ieee_is_nan(gz(i)) .or. &
+          .not. ieee_is_finite(z(i)) .or. .not. ieee_is_finite(gz(i))) then
+        status = FC_ERR_INFEASIBLE_LIN
+        return
+      end if
+      if (abs(gz(i)) > g_max) g_max = abs(gz(i))
+      if (abs(z(i)) > z_inf)  z_inf = abs(z(i))
+      if (z(i) < l(i) .or. z(i) > u(i)) z_box_feas = .false.
+    end do
+
+    use_delta = .false.
+    if (z_box_feas .and. g_max > 1.0e-250_dp .and. g_max < 1.0e-4_dp * max(1.0_dp, z_inf)) then
+      call analyze_lin_box(d, l, u, a, b, alpha_max, a_hat_l1, b_hat, &
+        b_hat_min, b_hat_max, tau_hat_feas, has_unb_lo, has_unb_hi, status)
+      if (status /= 0_i32) return
+
+      s_lin = 0.0_dp
+      c_lin = 0.0_dp
+      do i = 1_i32, d
+        if (abs(a(i)) > 0.0_dp) then
+          a_hat_i = a(i) / alpha_max
+          call neumaier_add_safe(s_lin, c_lin, a_hat_i * z(i))
+        end if
+      end do
+      call neumaier_add_safe(s_lin, c_lin, -b_hat)
+      lin_hat_err = abs(neumaier_finalize_safe(s_lin, c_lin))
+
+      base_tol = min(0.2_dp * FC_HUGE, safe_pos_div_cap(1.0_dp, alpha_max)) + &
+                 min(0.2_dp * FC_HUGE, abs(b_hat))
+      if (z_inf <= 1.0_dp .or. a_hat_l1 <= 0.2_dp * FC_HUGE / z_inf) then
+        az_term = a_hat_l1 * z_inf
+      else
+        az_term = 0.2_dp * FC_HUGE
+      end if
+      if (lin_hat_err <= (8.0_dp * FC_EPS) * (base_tol + az_term)) then
+        use_delta = .true.
+      end if
+    end if
+
+    if (use_delta) then
+      call solve_delta_lin_proj(d, z, l, u, a, gz, alpha_max, a_hat_l1, g_max, &
+        work_d, nu_tmp)
+      do i = 1_i32, d
+        ri_abs = abs(work_d(i))
+        if (ri_abs > box_inf) box_inf = ri_abs
+      end do
+      return
+    end if
+
+    do i = 1_i32, d
+      work_d(i) = safe_sub_dp(z(i), gz(i))
+    end do
+    call fc_box_lin_project(d, l, u, a, b, work_d, nu_tmp, status)
+    if (status /= 0_i32) return
+
+    do i = 1_i32, d
+      ri_abs = abs(safe_sub_dp(z(i), work_d(i)))
+      if (ri_abs > box_inf) box_inf = ri_abs
+    end do
+  end subroutine fc_box_lin_kkt_inf
 
   !---------------------------------------------------------------------------
   ! Boundary active-face partition relative to reduced Lagrangian gradient

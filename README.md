@@ -1,12 +1,12 @@
 # fortchuck: Zero-Allocation Coupled Box/Simplex × Stiefel Product-Manifold Quasi-Newton Optimizer
 
 [![CI Matrix](https://github.com/sneed-and-feed/fortchuck/actions/workflows/ci.yml/badge.svg)](https://github.com/sneed-and-feed/fortchuck/actions/workflows/ci.yml)
-[![Lean 4 Formalization](https://img.shields.io/badge/Lean_4-7_theorems_0_sorry-00f0ff.svg?style=flat-square)](formalization/Fortchuck.lean)
+[![Lean 4 Formalization](https://img.shields.io/badge/Lean_4-15_theorems_0_sorry-00f0ff.svg?style=flat-square)](formalization/Fortchuck.lean)
 [![Fortran 2018 Zero-Alloc](https://img.shields.io/badge/Fortran_2018-0_heap_alloc_pure-b844ff.svg?style=flat-square)](scripts/verify_zero_alloc.py)
 [![OpenMP Reentrancy](https://img.shields.io/badge/OpenMP-16--thread_bit--identical-ffb800.svg?style=flat-square)](test/test_openmp_reentrancy.f90)
 [![License](https://img.shields.io/badge/License-CC0--1.0_Universal-lightgrey.svg?style=flat-square)](LICENSE)
 
-A standalone, zero-heap-allocation, `100%` OpenMP-reentrant **Modern Fortran 2018 + ANSI C99 ABI + Zero-Copy Python (`ctypes`)** solver (`v0.2.0`) for smooth nonconvex optimization over heterogeneous products of bound-constrained Euclidean boxes, singly-linearly-constrained simplices/knapsacks, and multiple Stiefel manifolds, paired with **7 machine-checked Lean 4** algebraic and variational theorems (`0 sorry`, `0` custom axioms, `0` compiler warnings) and a strictly blind 30-seed (`2,640`-run) three-suite referee benchmark archive.
+A standalone, zero-heap-allocation, `100%` OpenMP-reentrant **Modern Fortran 2018 + ANSI C99 ABI + Zero-Copy Python (`ctypes`)** solver (`v0.2.1`) for smooth nonconvex optimization over heterogeneous products of bound-constrained Euclidean boxes, singly-linearly-constrained simplices/knapsacks, and multiple Stiefel manifolds, paired with **15 machine-checked Lean 4** algebraic, invertibility, L-BFGS positive-definiteness, and variational theorems (`0 sorry`, `0` custom axioms, `0` compiler warnings) and a strictly blind 40-seed (`3,520`-run, incl. virgin one-shot `blind4` `401..410`) four-suite referee benchmark archive.
 
 ---
 
@@ -16,7 +16,7 @@ A standalone, zero-heap-allocation, `100%` OpenMP-reentrant **Modern Fortran 201
 - [2. Coupled Product Geometry and v0.2.0 Four-Pillar Architecture](#2-coupled-product-geometry-and-v020-four-pillar-architecture)
 - [3. Lean 4 Formal Verification](#3-lean-4-formal-verification)
 - [4. Quickstart: Zero-Copy Python, Modern Fortran 2018, and ANSI C99](#4-quickstart-zero-copy-python-modern-fortran-2018-and-ansi-c99)
-- [5. Blind 30-Seed Benchmark Suite and Native CLI Telemetry](#5-blind-30-seed-benchmark-suite-and-native-cli-telemetry)
+- [5. Blind 40-Seed Benchmark Suite and Native CLI Telemetry](#5-blind-40-seed-benchmark-suite-and-native-cli-telemetry)
 - [6. Repository Structure and Verification Gates](#6-repository-structure-and-verification-gates)
 - [7. Citation](#7-citation)
 - [8. License](#8-license)
@@ -25,7 +25,7 @@ A standalone, zero-heap-allocation, `100%` OpenMP-reentrant **Modern Fortran 201
 
 ## 1. Executive Overview
 
-`sneed-and-feed/fortchuck` (`v0.2.0`, `CC0-1.0` Public Domain) solves smooth coupled problems over arbitrary Cartesian products of box- or simplex/knapsack-constrained coordinates and orthogonal Stiefel frames:
+`sneed-and-feed/fortchuck` (`v0.2.1`, `CC0-1.0` Public Domain) solves smooth coupled problems over arbitrary Cartesian products of box- or simplex/knapsack-constrained coordinates and orthogonal Stiefel frames:
 
 ```math
 \min_{z \in \mathcal D, \; X_1, \dots, X_R} \; f(z, X_1, \dots, X_R)
@@ -60,7 +60,7 @@ and $l_i \le u_i$ (including fixed variables `l_i == u_i`, unbounded sentinel li
 
 Existing optimization toolboxes force practitioners to choose between smooth manifold solvers without native bound or linear-conservation constraints (where `tanh` warps and $\tfrac{\rho}{2}(a^\top z - b)^2$ penalties stall at $\mathcal O(1/\rho)$ feasibility errors) and alternating block-coordinate schemes (which destroy joint quasi-Newton cross-curvature). `fortchuck` unifies active-set projection, singly-linearly-constrained KKT nullspace geometry, and Riemannian quasi-Newton transport from first principles ([`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md)):
 
-### 2.1 Safeguarded Bertsekas Active Band, Coordinatewise `diag_box`, and Hermite Arc Interpolation
+### 2.1 Safeguarded Bertsekas Active Band, Rotation-Invariant BB2 Seeding, and Scale-Invariant Arc Search
 
 At iterate $p_k = (z_k, X_{1,k}, \dots, X_{R,k})$, `fortchuck` partitions $\{1, \dots, d\}$ into fixed coordinates (`l_i == u_i`),
 safeguarded outward-pointing active-band coordinates $\mathcal A_{\epsilon_k}(z_k)$,
@@ -70,7 +70,8 @@ and free coordinates $\mathcal F_{\epsilon_k}(z_k)$. Inside every L-BFGS two-loo
 \tilde\sigma_j = \sum_{i \in \mathcal F_{\epsilon_k}} s_{j,\mathrm{box},i} y_{j,\mathrm{box},i} + \sigma_{j,\mathrm{St}}^{sy} \ge 10^{-10} \sqrt{\tilde\nu_{s,j} \tilde\nu_{y,j}}
 ```
 
-eliminating clamped-multiplier cross-contamination (`FM-2`). In `v0.2.0`, free Euclidean coordinates are preconditioned by a safeguarded coordinatewise secant diagonal `diag_box(1:d)` clamped around the persistent block Barzilai--Borwein scalar $\gamma_{\mathrm{box}}$, while backtracking combines exact free-wall breakpoint detection (`fc_box_breakpoint_cap`) with safeguarded Quadratic and Cubic Hermite interpolation over $[0.1\tau, \, 0.5\tau]$ along the Zhang--Hager nonmonotone reference arc.
+eliminating clamped-multiplier cross-contamination (`FM-2`). In `v0.2.1`, free Euclidean coordinates use rotation-invariant scalar Oren--Luenberger / BB2 seeding $\gamma_{\mathrm{box}} \in [10^{-20}, 10^{20}]$ (eliminating coordinatewise seed distortion on rotated valleys while preserving exact `v0.2.0` workspace ABI),
+paired with a dimensionless cosine chord-descent check ($\Delta_\tau \le -10^{-12} \lVert s(\tau) \rVert_2 g_0$, invariant under objective rescaling $f \mapsto \alpha f$ across $\alpha \in [10^{-14}, 10^{12}]$), cancellation-free delta-space KKT residuals, and safeguarded Quadratic/Cubic Hermite backtracking over $[0.1\tau, \, 0.5\tau]$ along the Zhang--Hager nonmonotone reference arc.
 
 ### 2.2 Dual-Regime Exact Cayley Retraction and Batched Level-3 Panel Transport
 
@@ -109,24 +110,32 @@ $w = H_k \tilde a$) solves the exact equality-constrained quasi-Newton KKT syste
 d_{\mathrm{free}} = u - \frac{\langle \tilde a, u \rangle - \delta_b}{\langle \tilde a, w \rangle} w, \qquad \langle \tilde a, d_{\mathrm{free}} \rangle = \delta_b
 ```
 
-which is provably invariant under arbitrary gauge shifts $g_z \mapsto g_z + \mu a$ and strictly descending whenever $\tilde g \notin \mathrm{span}(\tilde a)$,
-paired with a non-jamming isotropic Spectral Projected Gradient (`SPG`) fallback $d_z^{\mathrm{SPG}} = P_{\mathcal C}(z_k - \alpha_k \nabla_z f) - z_k$ that releases simplex corners in a single step (`FM-13`).
+which is provably invariant under arbitrary gauge shifts $g_z \mapsto g_z + \mu a$ and strictly descending for homogeneous steps whenever $\tilde g \notin \mathrm{span}(\tilde a)$,
+paired with active-bound outward hold during trial projection (preventing multiplier-shift lift-off on tightly capped simplices), Stiefel L-BFGS history preservation across box-only active-face degeneracy, a runtime directional-derivative guard, and a non-jamming isotropic Spectral Projected Gradient (`SPG`) fallback $d_z^{\mathrm{SPG}} = P_{\mathcal C}(z_k - \alpha_k \nabla_z f) - z_k$ that releases simplex corners in a single step (`FM-13`).
 
 ---
 
 ## 3. Lean 4 Formal Verification
 
-All 7 core algebraic identities, branch equivalences, variational projection inequalities, and KKT nullspace quasi-Newton descent theorems are machine-checked in [`formalization/Fortchuck.lean`](formalization/Fortchuck.lean) (`leanprover/lean4:v4.34.0-rc2` + Mathlib4, `1,090` lines, `0 sorry`, `0` custom axioms, `0` warnings):
+All **15** foundational algebraic, unconditional invertibility, Branch A batched transport, filtered L-BFGS positive-definiteness, variational projection, and KKT nullspace theorems are machine-checked in [`formalization/Fortchuck.lean`](formalization/Fortchuck.lean) (`leanprover/lean4:v4.34.0-rc2` + Mathlib4, `2,074` lines, `0 sorry`, `0` custom axioms, `0` compiler warnings, `0` orphan definitions — every theorem individually audited via `lean_verify` to depend solely on `[propext, Classical.choice, Quot.sound]`):
 
-| # | Theorem Identifier | Mathematical Guarantee | Machine-Checked Statement |
+| Pillar | Theorem Identifier | Mathematical Guarantee | Machine-Checked Statement |
 | :---: | :--- | :--- | :--- |
 | 1 | `skew_generator_properties` | $\mathfrak{so}(n)$ Lie Generator & Tangent Reproduction | $X^\top X = I_p \land X^\top \xi + \xi^\top X = 0 \implies W_\xi^\top = -W_\xi \land W_\xi X = \xi$ |
-| 2 | `cayley_rotor_orthogonality_and_isometry` | Two-Sided Rotor Orthogonality & Canonical Isometry | $Q = 2 M - I_n, \; Q^\top Q = Q Q^\top = I_n, \; \langle Q \zeta_1, Q \zeta_2 \rangle_{Q X} = \langle \zeta_1, \zeta_2 \rangle_X$ |
-| 3 | `schur_woodbury_cayley_orthogonality` | Rank $2p$ Schur-Woodbury Exact Feasibility | $Y = (2 X + \tau K) J(\tau)^{-1} - X \implies Y^\top Y = I_p$ |
-| 4 | `cayley_branch_a_eq_branch_b` | Algebraic Equivalence of Branch A and Branch B | $Q(\tau) X = (2 X + \tau K) J(\tau)^{-1} - X$ identically for all $(n, p, \tau)$ |
-| 5 | `coupled_two_metric_strict_descent` | Unconditional Box × Stiefel Strict Descent & KKT | $\phi'(0^+) \le -\gamma_{\min} \lVert g_{\mathcal A^{\mathrm{int}}} \rVert_2^2 - \lambda_{\min} \lVert \tilde g \rVert^2 \le 0$, with $\phi'(0^+) = 0 \iff \mathrm{KKT}(z, X)$ |
-| 6 | `simplex_box_projection_variational` | Variational `SLBQP` Optimality & `SPG` Tangency/Descent | $\langle y - z^\ast, z - z^\ast \rangle \le 0, \; a^\top d_{\mathrm{spg}} = 0, \; \langle g, d_{\mathrm{spg}} \rangle \le -\gamma^{-1} \lVert d_{\mathrm{spg}} \rVert_2^2$ |
-| 7 | `rank1_kkt_nullspace_quasinewton_descent` | Rank-1 KKT Nullspace Tangency, Shift Invariance & Descent | $a^\top d_{\mathrm{kkt}}(g) = 0, \; d_{\mathrm{kkt}}(g + \mu a) = d_{\mathrm{kkt}}(g), \; \langle g, d_{\mathrm{kkt}}(g) \rangle = -\langle v, H v \rangle \le 0$ |
+| 2a | `cayley_resolvent_isUnit` | Unconditional Resolvent Invertibility | $W^\top = -W \implies \mathrm{IsUnit}(I_n - \tfrac{\tau}{2} W)$ for all $\tau \in \mathbb R$ |
+| 2b | `cayley_rotor_orthogonality_and_isometry` | Two-Sided Rotor Orthogonality & Canonical Isometry | $Q = 2 M - I_n, \; Q^\top Q = Q Q^\top = I_n, \; \langle Q \zeta_1, Q \zeta_2 \rangle_{Q X} = \langle \zeta_1, \zeta_2 \rangle_X$ |
+| 3a | `schur_woodbury_isUnit` | Unconditional Schur-Woodbury Invertibility | $A^\top = -A \implies \mathrm{IsUnit}(I_p - \tfrac{\tau}{2} A + \tfrac{\tau^2}{4} K^\top K)$ for all $\tau \in \mathbb R$ |
+| 3b | `schur_woodbury_cayley_orthogonality` | Rank $2p$ Schur-Woodbury Exact Feasibility | $Y = (2 X + \tau K) J(\tau)^{-1} - X \implies Y^\top Y = I_p$ |
+| 4a | `cayley_branch_a_eq_branch_b` | Retraction Equivalence of Branch A and Branch B | $Q(\tau) X = (2 X + \tau K) J(\tau)^{-1} - X$ identically for all $(n, p, \tau)$ |
+| 4b | `cayley_branch_a_transport_eq_branch_b` | Single & Batched Panel Transport Equivalence | $Q(\tau) \zeta = \mathcal T_A(X, \xi, \tau, \zeta)$ for arbitrary panel $\zeta \in \mathbb R^{n \times q}$ |
+| 4c | `schur_woodbury_transport_isometry` | Branch A Canonical Transport Isometry | $Y^\top \mathcal T_A(\zeta_1) = X^\top \zeta_1, \; \langle \mathcal T_A(\zeta_1), \mathcal T_A(\zeta_2) \rangle_Y = \langle \zeta_1, \zeta_2 \rangle_X$ |
+| 5a | `lbfgs_two_loop_symm_posDef_bound` | Inductive Filtered Two-Loop Symmetry & PD Bound | $\forall j, \langle s_j, y_j \rangle > 0 \implies \exists \lambda_{\min} > 0, \; \langle v, H v \rangle \ge \lambda_{\min} \lVert v \rVert^2$ |
+| 5b | `coupled_two_metric_strict_descent` | Unconditional Box × Stiefel Strict Descent & KKT | $\phi'(0^+) \le -\gamma_{\min} \lVert g_{\mathcal A^{\mathrm{int}}} \rVert_2^2 - \lambda_{\min} \lVert \tilde g \rVert^2 \le 0$, with $\phi'(0^+) = 0 \iff \mathrm{KKT}(z, X)$ |
+| 5c | `masked_lbfgs_coupled_strict_descent` | End-to-End Masked Product L-BFGS Descent | Discharges `h_free_pd` directly from `lbfgsTwoLoop` + `filter_free_subspace_pairs` |
+| 6a | `simplex_box_dual_root_exists` | Feasibility Certificate & IVT Dual Root Existence | $\mathcal C \neq \emptyset \iff \underline b \le b \le \overline b \implies \exists \nu \in \mathbb R, \; \sum_i a_i z^\ast_i(\nu) = b$ |
+| 6b | `simplex_box_projection_variational` | Variational `SLBQP` Optimality, Shift Invariance & `SPG` | $\langle y - z^\ast, z - z^\ast \rangle \le 0, \; P_{\mathcal C}(y + \mu a) = P_{\mathcal C}(y), \; \langle g, d_{\mathrm{spg}} \rangle \le -\gamma^{-1} \lVert d_{\mathrm{spg}} \rVert_2^2$ |
+| 6c | `coupled_spg_stiefel_strict_descent` | Coupled $\mathcal C \times \prod \mathrm{St}$ Fallback Descent | Unconditional feasibility & strict descent of `fc_spg_lin_direction` |
+| 7 | `rank1_kkt_nullspace_quasinewton_descent` | Rank-1 KKT Nullspace Tangency, Shift & Inhomogeneous Formula | $a^\top d = 0, \; d(g + \mu a) = d(g), \; g^\top d_{\mathrm{inhom}} = -v^\top H v + \tfrac{\delta_b}{a^\top H a}(g^\top H a)$ |
 
 ---
 
@@ -278,9 +287,9 @@ int run_c99_constrained_example(fc_eval_fg_cb cb, void *udata) {
 
 ---
 
-## 5. Blind 30-Seed Benchmark Suite and Native CLI Telemetry
+## 5. Blind 40-Seed Benchmark Suite and Native CLI Telemetry
 
-To prevent hyperparameter overfitting, [`benchmarks/`](benchmarks) enforces a strict blind firewall from `src/*.f90`. Every solver is initialized from bit-identical `PCG64` feasible points across **30 deterministic seeds** (`10` primary `101..110`, `10` out-of-sample holdout `201..210`, and `10` untouched third blind holdout `301..310`, totaling **`2,640` runs** across `11` problems × `8` solvers). All `330` initial analytical Euclidean gradients are pre-verified against central finite differences to relative error $\le 1.98 \times 10^{-8} \le 10^{-7}$ ([`benchmarks/referee.py`](benchmarks/referee.py)), and `fortchuck` runs with **strictly frozen out-of-the-box** `FCOptions(gtol=1e-6, max_eval=5000)` (`memory = 7`, `max_iter = 15000`, `zh_eta` auto `0.85`, canonical metric, cautious skip) across every problem and seed.
+To prevent hyperparameter overfitting, [`benchmarks/`](benchmarks) enforces a strict blind firewall from `src/*.f90`. Every solver is initialized from bit-identical `PCG64` feasible points across **40 deterministic seeds**: `10` primary (`101..110`), `10` holdout (`201..210`), `10` third holdout (`301..310`), and `10` **virgin fourth blind holdout (`401..410`)** held completely untouched until all `v0.2.1` solver fixes were frozen and passed every sanitizer and unit gate. All `440` initial analytical Euclidean gradients are pre-verified against central finite differences to relative error $\le 1.98 \times 10^{-8} \le 10^{-7}$ ([`benchmarks/referee.py`](benchmarks/referee.py)), and `fortchuck` runs with **strictly frozen out-of-the-box** `FCOptions(gtol=1e-6, max_eval=5000)` (`memory = 7`, `max_iter = 15000`, `zh_eta` auto `0.85`, canonical metric, cautious skip) across every problem and seed.
 
 A run is certified **Solved** by the independent pure-NumPy referee (`project_linear_box_ref`, zero `fortchuck` calls) if and only if:
 
@@ -292,7 +301,7 @@ A run is certified **Solved** by the independent pure-NumPy referee (`project_li
 \max\!\left(\mathcal V_{\mathrm{box}}, \, \mathcal V_{\mathrm{lin}}, \, \mathcal V_{\mathrm{orth}}\right) \le 10^{-8}, \qquad \mathcal V_{\mathrm{lin}} = \frac{\lvert a^\top z - b \rvert}{1 + \lvert b \rvert}
 ```
 
-Full per-seed JSON archives and per-problem breakdowns are stored in [`results/blind_benchmark_summary.json`](results/blind_benchmark_summary.json) and [`results/blind_benchmark_report.md`](results/blind_benchmark_report.md).
+Full machine-readable `3,520`-run (`40` seeds × `11` problems × `8` solvers) JSON archives and per-problem breakdowns are stored in [`results/blind_benchmark_summary.json`](results/blind_benchmark_summary.json) and [`results/blind_benchmark_report.md`](results/blind_benchmark_report.md).
 
 ### 5.1 Canonical 11-Instance Benchmark Matrix (`B1` through `B8B`)
 
@@ -307,34 +316,36 @@ Full per-seed JSON archives and per-problem breakdowns are stored in [`results/b
 | `B6` | Box-Coupled Brockett with Certified Ky Fan QP Truth | $[0.1, 5]^{10} \times \mathrm{St}(150, 10)$ | Branch A, $\kappa(M) = 10^4$, certified analytical global optimum $f^\ast$ |
 | `B7A` | Pure-Box Active-Bound Chained Rosenbrock + Quadratic | $[l, u]^{500} \; (R = 0)$ | Pure Box ($5$ fixed $l_i = u_i$, $\sim 60\%$ active bounds) vs `SciPy L-BFGS-B` |
 | `B7B` | Pure-Stiefel Tall Brockett & Orthogonal Procrustes | $\mathrm{St}(200, 8) \times \mathrm{St}(24, 24) \; (d = 0)$ | Pure Stiefel Branch A & Branch B $(\mathrm{SO}(24))$ vs native `pymanopt` |
-| `B8A` | Trace-Constrained Ensemble Kohn--Sham DFT (`v0.2.0`) | $\mathcal C^{12} \times \mathrm{St}(120, 12) \; (\mathbf{1}^\top z = 5)$ | Hard Fermi--Dirac electron conservation (`SLBQP` + Rank-1 KKT Nullspace) |
-| `B8B` | Long-Only Weighted Orthogonal Risk-Factor Parity (`v0.2.0`) | $\mathcal C^{24} \times \mathrm{St}(32, 6) \times \mathrm{St}(6, 6)$ | Weighted budget $a^\top z = 1$ ($N_{\mathrm{tot}} = 252 \le 450$, direct `SLSQP`/`trust-constr` comparison) |
+| `B8A` | Trace-Constrained Ensemble Kohn--Sham DFT (`v0.2.0+`) | $\mathcal C^{12} \times \mathrm{St}(120, 12) \; (\mathbf{1}^\top z = 5)$ | Hard Fermi--Dirac electron conservation (`SLBQP` + Rank-1 KKT Nullspace) |
+| `B8B` | Long-Only Weighted Orthogonal Risk-Factor Parity (`v0.2.0+`) | $\mathcal C^{24} \times \mathrm{St}(32, 6) \times \mathrm{St}(6, 6)$ | Weighted budget $a^\top z = 1$ ($N_{\mathrm{tot}} = 252 \le 450$, direct `SLSQP`/`trust-constr` comparison) |
 
-### 5.2 Pooled 30-Seed Aggregate Summary (`Seeds 101..110 + 201..210 + 301..310`, `330` Slots/Solver)
+### 5.2 Pooled 40-Seed 8-Solver Aggregate Summary (`Seeds 101..410`, `440` Slots/Solver, `3,520` Runs)
+
+Pooled metrics across all four blind suites (`101..110`, `201..210`, `301..310`, and virgin one-shot `401..410`), with explicit directional two-sided Wilcoxon polarity (`FC better` means the signed-rank sum favors lower/better values for `fortchuck`, `FC worse` favors the baseline):
 
 | Solver | Evaluated Runs | Solved Runs | Solve Rate | Penalized Evals Med (IQR) | Wall Time ms Med (IQR) | Median KKT Ref | Max Lin Viol | Median Orth Viol | Wilcoxon Evals p (2-sided) | Wilcoxon KKT p (2-sided) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `fortchuck` | 330 | **312** | **94.5%** | **524.5 (1651.5)** | **298.35 (1021.87)** | `8.34e-07` | `1.90e-14` | `3.28e-14` | `—` | `—` |
-| `fortchuck-ABB` | 330 | 232 | 70.3% | 1262.0 (4906.0) | 295.36 (1575.94) | `8.32e-07` | `8.59e-15` | `3.01e-14` | `3.27e-34` | `1.30e-13` |
-| `Alternating-BCD` | 330 | 160 | 48.5% | 5000.0 (4650.8) | 2436.93 (3434.81) | `1.17e-05` | `5.55e-16` | `1.10e-15` | `7.77e-42` | `1.03e-40` |
-| `pymanopt-Warped-CG` | 330 | 73 | 22.1% | 5000.0 (0.0) | 5406.79 (4480.17) | `1.68e-03` | `9.80e-05` | `1.13e-15` | `6.62e-53` | `2.00e-54` |
-| `pymanopt-TrustRegions` | 330 | 79 | 23.9% | 5000.0 (0.0) | 3507.79 (2741.58) | `3.87e-03` | `8.32e-05` | `2.71e-15` | `6.62e-53` | `3.99e-47` |
-| `SciPy-L-BFGS-B` | 330 | 30 | 9.1% | 5000.0 (0.0) | 2759.82 (3658.59) | `1.30e-04` | `1.02e-06` | `5.20e-06` | `5.62e-51` | `5.17e-55` |
-| `SciPy-SLSQP` | 60 (`N_tot <= 450`) | 60 | 100.0% (`18.2%` all) | 58.0 (41.8) | 261.06 (404.25) | `6.17e-07` | `1.44e-15` | `1.17e-12` | `2.80e-02` | `7.40e-01` |
-| `SciPy-trust-constr` | 60 (`N_tot <= 450`) | 30 | 50.0% (`9.1%` all) | 2572.0 (4911.5) | 1920.18 (3107.86) | `1.29e-06` | `5.55e-16` | `1.42e-14` | `1.63e-11` | `9.28e-11` |
+| `fortchuck` (`v0.2.1`) | 440 | **440** | **100.0%** | **472.0 (1505.2)** | **206.77 (1130.73)** | `7.91e-07` | `2.96e-16` | `2.68e-14` | `—` | `—` |
+| `fortchuck-ABB` (`v0.2.1`) | 440 | 330 | 75.0% | 1016.5 (4905.2) | 337.29 (1735.68) | `8.17e-07` | `1.78e-15` | `3.15e-14` | `2.20e-70 (FC better)` | `3.28e-18 (FC better)` |
+| `Alternating-BCD` | 440 | 213 | 48.4% | 5000.0 (4643.0) | 2424.09 (3233.56) | `1.17e-05` | `5.55e-16` | `1.09e-15` | `3.68e-65 (FC better)` | `2.26e-57 (FC better)` |
+| `pymanopt-Warped-CG` | 440 | 98 | 22.3% | 5000.0 (0.0) | 4950.47 (4332.76) | `1.70e-03` | `9.80e-05` | `1.13e-15` | `7.94e-74 (FC better)` | `1.96e-72 (FC better)` |
+| `pymanopt-TrustRegions` | 440 | 106 | 24.1% | 5000.0 (0.0) | 3201.50 (2637.97) | `3.77e-03` | `8.32e-05` | `2.65e-15` | `7.94e-74 (FC better)` | `9.41e-63 (FC better)` |
+| `SciPy-L-BFGS-B` | 440 | 40 | 9.1% | 5000.0 (0.0) | 2715.65 (3652.59) | `1.30e-04` | `1.02e-06` | `5.29e-06` | `9.69e-72 (FC better)` | `5.29e-73 (FC better)` |
+| `SciPy-SLSQP` | 80 (`N_tot <= 450`) | 80 | 100.0% (`18.2%` all) | 58.0 (41.5) | 261.06 (395.50) | `6.31e-07` | `1.44e-15` | `1.17e-12` | `5.09e-10 (FC better)` | `7.05e-01 (FC worse)` |
+| `SciPy-trust-constr` | 80 (`N_tot <= 450`) | 40 | 50.0% (`9.1%` all) | 2572.0 (4913.0) | 1898.06 (2960.78) | `1.29e-06` | `5.55e-16` | `7.55e-15` | `7.53e-15 (FC better)` | `1.87e-13 (FC better)` |
 
-### 5.3 Multi-Suite Generalization Across Primary (`101..110`), Holdout (`201..210`), and Untouched Blind3 (`301..310`)
+### 5.3 Four-Suite Generalization Across Primary (`101..110`), Holdout (`201..210`), Blind3 (`301..310`), and Virgin One-Shot `Blind4` (`401..410`)
 
-| Solver | Primary Solved (`101..110`) | Primary Pen. Evals Med | Holdout Solved (`201..210`) | Holdout Pen. Evals Med | Blind3 Solved (`301..310`) | Blind3 Pen. Evals Med | Blind3 Wilcoxon Evals p |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `fortchuck` | **106/110 (96.4%)** | **506.5** | **103/110 (93.6%)** | **527.0** | **103/110 (93.6%)** | **531.0** | `—` |
-| `fortchuck-ABB` | 75/110 (68.2%) | 1303.0 | 80/110 (72.7%) | 1324.0 | 77/110 (70.0%) | 975.0 | `9.73e-13` |
-| `Alternating-BCD` | 54/110 (49.1%) | 5000.0 | 53/110 (48.2%) | 5000.0 | 53/110 (48.2%) | 5000.0 | `1.98e-15` |
-| `pymanopt-Warped-CG` | 23/110 (20.9%) | 5000.0 | 25/110 (22.7%) | 5000.0 | 25/110 (22.7%) | 5000.0 | `1.25e-18` |
-| `pymanopt-TrustRegions` | 24/110 (21.8%) | 5000.0 | 27/110 (24.5%) | 5000.0 | 28/110 (25.5%) | 5000.0 | `1.25e-18` |
-| `SciPy-L-BFGS-B` | 10/110 (9.1%) | 5000.0 | 10/110 (9.1%) | 5000.0 | 10/110 (9.1%) | 5000.0 | `6.16e-18` |
-| `SciPy-SLSQP` | 20/20 (100.0%) | 59.0 | 20/20 (100.0%) | 54.0 | 20/20 (100.0%) | 58.0 | `4.78e-01` |
-| `SciPy-trust-constr` | 10/20 (50.0%) | 2564.5 | 10/20 (50.0%) | 2572.0 | 10/20 (50.0%) | 2564.0 | `1.91e-06` |
+| Solver | Primary (`101..110`) | Holdout (`201..210`) | Blind3 (`301..310`) | **Virgin `Blind4` (`401..410`)** | `Blind4` Pen. Evals Med | `Blind4` Wilcoxon Evals p |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `fortchuck` (`v0.2.1`) | **110/110 (100.0%)** | **110/110 (100.0%)** | **110/110 (100.0%)** | **110/110 (100.0%)** | **472.5** | `—` |
+| `fortchuck-ABB` (`v0.2.1`) | 82/110 (74.5%) | 83/110 (75.5%) | 84/110 (76.4%) | 81/110 (73.6%) | 775.5 | `1.57e-18 (FC better)` |
+| `Alternating-BCD` | 54/110 (49.1%) | 53/110 (48.2%) | 53/110 (48.2%) | 53/110 (48.2%) | 5000.0 | `3.39e-17 (FC better)` |
+| `pymanopt-Warped-CG` | 23/110 (20.9%) | 25/110 (22.7%) | 25/110 (22.7%) | 25/110 (22.7%) | 5000.0 | `8.74e-20 (FC better)` |
+| `pymanopt-TrustRegions` | 24/110 (21.8%) | 27/110 (24.5%) | 28/110 (25.5%) | 27/110 (24.5%) | 5000.0 | `8.74e-20 (FC better)` |
+| `SciPy-L-BFGS-B` | 10/110 (9.1%) | 10/110 (9.1%) | 10/110 (9.1%) | 10/110 (9.1%) | 5000.0 | `2.15e-19 (FC better)` |
+| `SciPy-SLSQP` | 20/20 (100.0%) | 20/20 (100.0%) | 20/20 (100.0%) | 20/20 (100.0%) | 59.5 | `5.69e-03 (FC better)` |
+| `SciPy-trust-constr` | 10/20 (50.0%) | 10/20 (50.0%) | 10/20 (50.0%) | 10/20 (50.0%) | 2553.5 | `8.78e-05 (FC better)` |
 
 ### 5.4 Zero-FFI Native Fortran 2018 CLI Telemetry (`app/fortchuck_bench.f90`)
 
@@ -344,15 +355,18 @@ Pure Fortran 2018 release timings (`gfortran -cpp -O3 -march=native -funroll-loo
 | :--- | :---: | :---: | :---: | :--- |
 | `[1]` Batched Panel Transport (`St(200,8)`, `K_batch=16`, `4000` reps) | `872.00 ms` vs `857.31 ms` (`0.98x`) | `1064.39 ms` vs `1113.94 ms` (`1.05x`) | **`358.99 ms` vs `454.35 ms` (`1.27x`)** | `max_err = 0.00e+00` vs `16` single-vector calls |
 | `[1]` Batched Panel Transport (`St(24,24)`, `K_batch=16`, `4000` reps) | `280.74 ms` vs `281.08 ms` (`1.00x`) | `324.28 ms` vs `327.19 ms` (`1.01x`) | `297.23 ms` vs `282.66 ms` (`0.95x`) | `max_err = 0.00e+00` vs `16` single-vector calls |
-| `[2]` `B6` Box-Coupled Ky Fan QP (`10/10` solved) | `973.56 ms` (`1976.0` evals) | `1215.56 ms` (`1982.0` iters) | **`659.38 ms`** | `max |f - f*| <= 5.98e-12`, `max_KKT <= 9.96e-07` |
+| `[2]` `B6` Box-Coupled Ky Fan QP (`10/10` solved) | `973.56 ms` (`1839.5` evals `v0.2.1`) | `1215.56 ms` | **`659.38 ms`** | `max |f - f*| <= 5.45e-12`, `max_KKT <= 9.96e-07` |
 | `[3]` `B7B` Tall Brockett + Procrustes (`10/10` solved) | `374.51 ms` (`m=7`) / `212.91 ms` (`m=0`) | `1395.26 ms` (`m=7`) / `728.05 ms` (`m=0`) | **`249.95 ms` (`m=7`) / `150.92 ms` (`m=0`)** | `max_KKT <= 9.99e-07`, `max_orth <= 9.67e-14` |
-| `[4]` `B8A` Hard-Trace Ensemble DFT (`10/10` solved) | `119.23 ms` (`214.0` evals) | `146.99 ms` (`213.0` iters) | **`68.19 ms` (`208.0` iters, `214.0` evals)** | `max |1^T z - 5| <= 1.52e-13` (`1.78e-15` WSL2), `max_KKT <= 1.00e-06` |
+| `[4]` `B8A` Hard-Trace Ensemble DFT (`10/10` solved) | `119.23 ms` (`214.0` evals) | `146.99 ms` (`213.0` iters) | **`68.19 ms` (`208.0` iters, `214.0` evals)** | `max |1^T z - 5| <= 1.78e-15` (`v0.2.1`), `max_KKT <= 1.00e-06` |
 
-### 5.5 Per-Problem, `v0.1.0 -> v0.2.0` Progression, and Global Optimality Highlights
+*(Tradeoff note: on cheap pure-Stiefel native callbacks like `B7B`, `m = 0` (`ABB`) can achieve lower native wall time than `m = 7` despite needing ~33% more evaluations because the `2m + 2` Cayley panel transport dominates callback cost; when objective/gradient evaluations are nontrivial, `m = 7` dominates in both evaluations and wall time.)*
 
-- **Hard Linear Conservation on `B8A` & `B8B` (`60/60 = 100%` Solved)**: On `B8A` (Trace-Constrained Ensemble Kohn--Sham DFT, `N_tot = 1452`), `fortchuck` solves `30/30` seeds in median **`151.0` evaluations** (`122.10 ms`, max `V_lin = 0.00e+00`), outperforming `Alternating-BCD` (`395.5` evals, `419.30 ms`, `p = 1.86e-09`) by **`2.62x` in evaluations and `3.43x` in wall time** while eliminating the soft trace penalty of `B1` (`2013.0` evals, `1384.87 ms` — a **`13.3x` evaluation reduction**). On `B8B` (`N_tot = 252 <= 450`), `fortchuck` solves `30/30` in `82.22 ms` (`max V_lin = 1.90e-14`), executing **`5.94x` faster** than dense `SciPy-SLSQP` (`488.74 ms`) and **`5.71x` faster** than `Alternating-BCD` (`469.59 ms`), whereas `SciPy-trust-constr` (`0/30`), `pymanopt-Warped-CG` (`0/30`, `V_lin ~ 5.2e-05`), `pymanopt-TrustRegions` (`0/30`), and `SciPy-L-BFGS-B` (`0/30`) solve **`0%`**.
-- **Certified Global Optimality (`B6` Ky Fan QP & `B7B` Procrustes, `60/60 = 100%` Solved)**: On `B6` ($f^\ast = -10.445509834730$), `fortchuck` solves `30/30` to median global gap `1.95e-12` (max `4.81e-12` across all 30 seeds) in `1346.82 ms` (`1.32x` faster than `v0.1.0` on the shared 20-seed cohort), while **every** external baseline solves `0/30`. On `B7B` ($f^\ast = -66.949417348256$), `fortchuck` solves `30/30` to median gap `6.25e-13` (max `1.31e-12`) in `496.0` evaluations and `430.78 ms` (`1.41x` wall-clock speedup over `v0.1.0`), outperforming `pymanopt` CG (`1069.5` evals, `1405.68 ms`, `29/30`) and `pymanopt-TrustRegions` (`1683.0` evals, `1218.61 ms`, `p = 1.86e-09`).
-- **Stiefel-Dominated Speedups & `30`-Seed Robustness (`B1`, `B2B`, `B3`, `B4`, `B5`, `B7A`)**: Across the 20 shared seeds from `v0.1.0`, batched panel transport and register-tiled kernels accelerate `B7B` (`1.41x`), `B6` (`1.32x`), `B1` (`1.31x`, with fewer evals `2084.5 -> 1959.0`), `B4` (`1.17x`), `B5` (`1.06x`, reaching `26/30 = 86.7%` solved across 30 seeds vs `0/30` for all baselines), and `B2B` (`1.05x`, `30/30` in `39.63 ms` — **`9.3x` fewer evaluations** than `fortchuck-ABB`'s `1203.5`). Coordinatewise `diag_box` preconditioning solves `30/30` on `B7A` in `17.48 ms` (**`2.24x` faster** than Fortran `SciPy-L-BFGS-B` `39.22 ms`) and `16/30` on multi-modal `B2A` (`vs 6/30` `Alternating-BCD`, `3/30` `ABB`, `0/30` `pymanopt`/`SciPy`).
+### 5.5 Key `v0.2.1` Improvements, Certified Global Optima & Nonconvex Stationarity Scope
+
+- **100% 40-Seed Convergence (`440/440`, incl. `110/110` on Virgin `Blind4`)**: Fixing the premature `FC_CONVERGED_FTOL` noise-floor exit lifted `B2A` from `16/30 (53%)` to **`40/40 (100%)`** (`585.0` med evals, `607.0` on virgin `blind4`) and `B5` from `26/30 (87%)` to **`40/40 (100%)`** (`1192.0` med evals, `1187.5` on virgin `blind4`), with `fortchuck` (`m = 7`) strictly beating `fortchuck-ABB` (`m = 0`) on all **11/11** problems (`p = 2.20e-70 (FC better)`).
+- **Hard Linear Conservation on `B8A` & `B8B` (`80/80 = 100%` Solved, `max V_lin <= 2.96e-16`)**: Eliminating active-bound projection lift-off slashed `B8B` from `250.0` evals (`466.0` Holdout) down to **`36.0` evals (`37.0` on virgin `blind4`, `8.66 ms`, `max V_lin = 1.11e-16`)**—beating `fortchuck-ABB` (`64.0` evals, `p = 3.55e-08 (FC better)`) and outperforming dense `SciPy-SLSQP` (`37.5` evals, `488.74 ms`) in both evaluations (`p = 5.09e-10 (FC better)` across shared 40-seed `B3 + B8B`, `p = 5.69e-03 (FC better)` on virgin `blind4`) and ~56x wall time. `B8A` solves `40/40` in `151.5` evals (`150.5` virgin `blind4`, `max V_lin = 2.96e-16`).
+- **Pure-Box Recovery on `B7A` (`40/40 = 100%`)**: Restoring rotation-invariant scalar BB2 seeding eliminated the `v0.2.0` `67.5 -> 126.0` regression, restoring `B7A` to **`68.0` evals (`67.5` on the shared 20-seed cohort, `68.0` on virgin `blind4`, `11.05 ms`)**—matching `v0.1.0` and `SciPy-L-BFGS-B` (`68.0` evals, `39.22 ms`) while running ~3.5x faster and beating `fortchuck-ABB` (`88.5` evals, `p = 3.51e-08 (FC better)`).
+- **Certified Global Optimality (`B6` & `B7B`) vs Nonconvex Local Stationarity (`B1`, `B2B`)**: On `B6` ($f^\ast = -10.445509834730$) and `B7B` ($f^\ast = -66.949417348256$), `fortchuck` solves `40/40` each to `max |f - f*| <= 3.60e-12` (`2.67e-12` virgin `blind4`) and `<= 1.31e-12` (`9.38e-13` virgin `blind4`), respectively. On multi-modal nonconvex benchmarks (`B1`, `B2A`, `B2B`, `B5`), `fortchuck` is a local first-order KKT solver: different algorithms can converge to distinct stationary basins (e.g., on `B2B`, `fortchuck` converges in `104.5` evals to median `8.517` while `fortchuck-ABB` takes `735.5` evals to reach median `8.301`), so global optimality is claimed strictly on `B6` and `B7B`.
 
 ---
 
@@ -399,15 +413,15 @@ fortchuck/
 ├── formalization/
 │   ├── lean-toolchain                # leanprover/lean4:v4.34.0-rc2
 │   ├── lakefile.lean                 # Lake build configuration
-│   └── Fortchuck.lean                # 7 machine-checked theorems (1,090 lines, 0 sorry, 0 warnings)
+│   └── Fortchuck.lean                # 15 machine-checked theorems (2,074 lines, 0 sorry, 0 warnings)
 ├── benchmarks/
 │   ├── problems.py                   # Canonical 11-instance benchmark suite (B1..B8B)
 │   ├── referee.py                    # Pure-NumPy project_linear_box_ref, KKT referee & FD verifier
 │   ├── baselines.py                  # Adapters for fortchuck, SciPy, pymanopt 2.2.1 & Alternating-BCD
-│   └── run_blind_suite.py            # 30-seed 3-suite blind runner & Wilcoxon statistical aggregator
+│   └── run_blind_suite.py            # 40-seed 4-suite blind runner & directional Wilcoxon aggregator
 ├── results/
-│   ├── blind_benchmark_summary.json  # Machine-readable 2,640-run (primary + holdout + blind3) archive
-│   └── blind_benchmark_report.md     # Full 30-seed Markdown report + v0.1.0->v0.2.0 & CLI telemetry
+│   ├── blind_benchmark_summary.json  # Unified 3,520-run (40-seed x 11-prob x 8-solver, incl. virgin blind4) JSON
+│   └── blind_benchmark_report.md     # Full 40-seed 8-solver Markdown report + progression & CLI telemetry
 ├── scripts/
 │   ├── audit_gfm_math.py             # 22-rule GitHub KaTeX/GFM Markdown compliance linter
 │   ├── build_shared.py               # Cross-platform fortchuck.dll / libfortchuck.so builder
@@ -428,16 +442,17 @@ fpm run fortchuck-bench --compiler gfortran --flag "-cpp -std=f2018 -O3 -march=n
 python scripts/build_shared.py
 python scripts/verify_zero_alloc.py
 
-# 3. Run Python ctypes FFI & pathological guard suite (41 tests)
+# 3. Run Python ctypes FFI & pathological guard suite (54 tests)
 pytest -v tests/
 
-# 4. Verify central FD gradients across all 30 seeds & run blind 3-suite benchmark (or --smoke)
+# 4. Verify central FD gradients across all 40 seeds & run blind 4-suite benchmark (or --smoke)
 python -m benchmarks.referee --seeds 101..110
 python -m benchmarks.referee --seeds 201..210
 python -m benchmarks.referee --seeds 301..310
+python -m benchmarks.referee --seeds 401..410
 python benchmarks/run_blind_suite.py --smoke
 
-# 5. Verify Lean 4 formal proofs (7 theorems, 0 sorry, 0 warnings) and 22-rule GFM/KaTeX math compliance
+# 5. Verify Lean 4 formal proofs (15 theorems, 0 sorry, 0 warnings) and 22-rule GFM/KaTeX math compliance
 cd formalization && lake build && cd ..
 python scripts/audit_gfm_math.py README.md results/blind_benchmark_report.md docs/ARCHITECTURE_SPEC.md docs/research/TOOLCHAIN_AND_STANDARDS.md docs/research/ARXIV_MANIFOLD_SURVEY.md docs/research/ARXIV_COUPLED_BOX_MANIFOLD_SURVEY.md
 ```
@@ -452,7 +467,7 @@ If you use `fortchuck` in academic research or production scientific computing, 
 @software{cohen2026fortchuck,
   author       = {Cohen, Noah},
   title        = {{fortchuck: Zero-Allocation Coupled Box/Simplex $\times$ Stiefel Product-Manifold Quasi-Newton Optimizer}},
-  version      = {0.2.0},
+  version      = {0.2.1},
   year         = {2026},
   license      = {CC0-1.0},
   url          = {https://github.com/sneed-and-feed/fortchuck}

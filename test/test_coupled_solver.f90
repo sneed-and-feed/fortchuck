@@ -31,6 +31,7 @@ module coupled_test_callbacks
     real(dp) :: z_targ(10)
     real(dp) :: a_shift(10)
     real(dp) :: shift_scale = 0.0_dp
+    real(dp) :: obj_scale   = 1.0_dp
   end type knapsack_ctx_t
 
   type :: lin_coupled_ctx_t
@@ -500,6 +501,10 @@ contains
       f_out     = f_out + 0.5_dp * ctx%w_quad(i) * di * di + &
                   ctx%shift_scale * ctx%a_shift(i) * z(i)
       gz_out(i) = ctx%w_quad(i) * di + ctx%shift_scale * ctx%a_shift(i)
+    end do
+    f_out = ctx%obj_scale * f_out
+    do i = 1_i32, d
+      gz_out(i) = ctx%obj_scale * gz_out(i)
     end do
     rc = 0_i32
   end function cb_knapsack10
@@ -1572,6 +1577,72 @@ contains
       c_funloc(cb_knapsack10), c_loc(kctx), c_loc(opts), &
       c_loc(work(1)), lwork_q, c_loc(iwork(1)), liwork_q, c_loc(res_c))
     call check_true(st == FC_ERR_INVALID_X0, 'project_initial=0 infeasible a^Tz0 /= b -> FC_ERR_INVALID_X0')
+
+    ! --- 6e. v0.2.1 Regression Guards: Scale Invariance (1e-14, 1e+12), project_initial=0 nu_k bias, partial query ---
+    call fc_init_default_options(opts)
+    call fc_workspace_query(d10, 0_i32, dummy_n, dummy_n, opts%memory, lwork_q, liwork_q, st)
+
+    ! Partial native workspace query: lwork=-1, liwork=0 must not overwrite iwork(1), and vice versa
+    w_q(1)  = -999.0_dp
+    iw_q(1) = -999_i32
+    call fc_solve_constrained(d10, 0_i32, dummy_n, dummy_n, z10_f, l10, u10, a10, b10, &
+      dummy_X, cb_knapsack10, c_loc(kctx), opts, w_q, -1_i64, iw_q, 0_i64, res_c)
+    call check_true(res_c%status == FC_SUCCESS_QUERY .and. int(w_q(1), i64) == lwork_q .and. &
+      iw_q(1) == -999_i32, 'native query lwork=-1, liwork=0 leaves iwork(1) untouched')
+
+    w_q(1)  = -999.0_dp
+    iw_q(1) = -999_i32
+    call fc_solve_constrained(d10, 0_i32, dummy_n, dummy_n, z10_f, l10, u10, a10, b10, &
+      dummy_X, cb_knapsack10, c_loc(kctx), opts, w_q, 0_i64, iw_q, -1_i64, res_c)
+    call check_true(res_c%status == FC_SUCCESS_QUERY .and. int(iw_q(1), i64) == liwork_q .and. &
+      abs(w_q(1) + 999.0_dp) <= 1.0e-12_dp, 'native query lwork=0, liwork=-1 leaves work(1) untouched')
+
+    ! Extreme objective scaling alpha = 1e-14 and 1e+12 on constrained knapsack
+    kctx%shift_scale = 0.0_dp
+    kctx%obj_scale   = 1.0e-14_dp
+    call fc_init_default_options(opts)
+    opts%gtol = 1.0e-22_dp
+    z10_c     = z10_0
+    call fc_solve_constrained(d10, 0_i32, dummy_n, dummy_n, z10_c, l10, u10, a10, b10, &
+      dummy_X, cb_knapsack10, c_loc(kctx), opts, work, lwork_q, iwork, liwork_q, res_c)
+    call check_true(res_c%status == FC_CONVERGED_GRAD, 'Scale-invariance alpha=1e-14 CONVERGED_GRAD')
+    call check_true(maxval(abs(z10_c - z10_f)) <= 1.0e-7_dp, 'Scale-invariance alpha=1e-14 z* match')
+    rc = cb_knapsack10(d10, 0_i32, dummy_n, dummy_n, z10_c, dummy_X, f_chk, gz10, dummy_GX, c_loc(kctx))
+    call fc_kkt_residual_constrained(d10, 0_i32, dummy_n, dummy_n, z10_c, l10, u10, a10, b10, &
+      dummy_X, gz10, dummy_GX, opts%metric, work, lwork_q, kkt_f, lin_f, orth_f, st)
+    call check_true(st == FC_SUCCESS_QUERY .and. kkt_f <= 1.0e-22_dp .and. &
+      abs(kkt_f - res_c%kkt_residual) <= 1.0e-26_dp, 'Scale-invariance alpha=1e-14 KKT parity')
+
+    kctx%obj_scale = 1.0e+12_dp
+    opts%gtol      = 1.0e-1_dp
+    z10_c          = z10_0
+    call fc_solve_constrained(d10, 0_i32, dummy_n, dummy_n, z10_c, l10, u10, a10, b10, &
+      dummy_X, cb_knapsack10, c_loc(kctx), opts, work, lwork_q, iwork, liwork_q, res_c)
+    call check_true(res_c%status == FC_CONVERGED_GRAD, 'Scale-invariance alpha=1e+12 CONVERGED_GRAD')
+    call check_true(maxval(abs(z10_c - z10_f)) <= 1.0e-7_dp, 'Scale-invariance alpha=1e+12 z* match')
+    kctx%obj_scale = 1.0_dp
+
+    ! project_initial = 0 with small linear residual (+-5e-9) and large normal shift (+-1e5)
+    call fc_init_default_options(opts)
+    opts%gtol            = 1.0e-8_dp
+    opts%project_initial = 0_i32
+    opts%max_iter        = 1000_i32
+    opts%max_eval        = 4000_i32
+    call fc_workspace_query(8_i32, 2_i32, n_m, p_m, opts%memory, lwork_q, liwork_q, st)
+    lctx%a_vec       = a8
+    lctx%shift_scale = 1.0e5_dp
+    z8 = z8_0
+    call fc_project_linear_box(8_i32, l8, u8, a8, b8, z8, nu_out, st)
+    z8(1) = min(u8(1), max(l8(1), z8(1) + 5.0e-9_dp / a8(1)))
+    X36 = X36_0
+    call fc_geqrf_pos(10_i32, 2_i32, X36(1:20), work(1:2), work(3:4), info)
+    call fc_geqrf_pos(4_i32, 4_i32, X36(21:36), work(1:4), work(5:8), info)
+    call fc_solve_constrained(8_i32, 2_i32, n_m, p_m, z8, l8, u8, a8, b8, X36, &
+      cb_lin_coupled_multi, c_loc(lctx), opts, work, lwork_q, iwork, liwork_q, res_c)
+    call check_true(res_c%status == FC_CONVERGED_GRAD, 'project_initial=0 +5e-9 large nu_k CONVERGED_GRAD')
+    call check_true(abs(sum(a8 * z8) - b8) <= lin_feas_tol(8_i32, a8, b8, z8), &
+      'project_initial=0 large nu_k |a^Tz* - b| <= tol_eq')
+    call check_true(maxval(abs(z8 - z8_ref)) <= 1.0e-7_dp, 'project_initial=0 large nu_k z* match')
   end subroutine test_constrained_linear_box_and_fm13
 
 end program test_coupled_solver

@@ -1,6 +1,6 @@
-# `fortchuck` Architecture & Mathematical Specification (`v0.2.0`)
+# `fortchuck` Architecture & Mathematical Specification (`v0.2.1`)
 
-> **Document Role**: Authoritative mathematical, algorithmic, systems-engineering, verification, and blind-benchmarking blueprint for **fortchuck** (`https://github.com/sneed-and-feed/fortchuck`, license `CC0-1.0 Universal`, version `0.2.0`). This specification reconciles and hardens the Phase 1 research syntheses (`docs/research/ARXIV_MANIFOLD_SURVEY.md`, `docs/research/ARXIV_COUPLED_BOX_MANIFOLD_SURVEY.md`, and `docs/research/TOOLCHAIN_AND_STANDARDS.md`) together with the `v0.2.0` four-pillar upgrade (batched Level-3 panel Cayley transport, coordinatewise diagonal box preconditioning + Hermite arc interpolation, coupled singly-linearly-constrained box/simplex optimization, and Lean 4 Theorems 6--7 + Benchmark `B8` + blind holdout `Seeds 301..310`) into a zero-allocation, OpenMP-reentrant Modern Fortran (`F2018`) + ANSI C99 ABI + zero-copy Python library.
+> **Document Role**: Authoritative mathematical, algorithmic, systems-engineering, verification, and blind-benchmarking blueprint for **fortchuck** (`https://github.com/sneed-and-feed/fortchuck`, license `CC0-1.0 Universal`, version `0.2.1`). This specification reconciles and hardens the Phase 1 research syntheses (`docs/research/ARXIV_MANIFOLD_SURVEY.md`, `docs/research/ARXIV_COUPLED_BOX_MANIFOLD_SURVEY.md`, and `docs/research/TOOLCHAIN_AND_STANDARDS.md`), the `v0.2.0` four-pillar upgrade, and the `v0.2.1` hardening release (full scale-invariance across $\alpha \in [10^{-14}, 10^{12}]$, rotation-invariant BB2 seeding, active-bound outward hold on $\mathcal C$, cancellation-free KKT residuals, `15` machine-checked Lean 4 theorems, and virgin 4th blind holdout `Seeds 401..410`) into a zero-allocation, OpenMP-reentrant Modern Fortran (`F2018`) + ANSI C99 ABI + zero-copy Python library.
 
 ---
 
@@ -300,37 +300,21 @@ and apply the in-place Level-1 updates:
 q_{\text{box},\mathcal F_{\epsilon_k}} \leftarrow q_{\text{box},\mathcal F_{\epsilon_k}} - \alpha_j y_{j,\text{box},\mathcal F_{\epsilon_k}}, \qquad q_r \leftarrow q_r - \alpha_j Y_{j,r}, \qquad A_{q,r} \leftarrow A_{q,r} - \alpha_j A_{Y,j,r}.
 ```
 
-In the **center scaling step**, equilibrate Stiefel blocks via cosine-guarded persistent BB2 scales $\gamma_k^{(r)} \in [10^{-10}, 10^{10}]$
-and precondition free box coordinates individually via the safeguarded coordinatewise diagonal inverse-curvature vector `diag_box(1:d)` ($D_{k,i}$):
+In the **center scaling step**, equilibrate Stiefel blocks via cosine-guarded persistent BB2 scales $\gamma_k^{(r)} \in [10^{-20}, 10^{20}]$
+and precondition free box coordinates via the rotation-invariant scalar Oren--Luenberger / BB2 seed $D_{k,i} = \gamma_k^{\text{box}}$ (stored in `diag_box(1:d)` to preserve exact `v0.2.0` workspace ABI compatibility):
 
 ```math
 q_{\text{box},i} \leftarrow D_{k,i} \, q_{\text{box},i} \;\; (i \in \mathcal F_{\epsilon_k}), \qquad q_r \leftarrow \gamma_k^{(r)} q_r, \qquad A_{q,r} \leftarrow \gamma_k^{(r)} A_{q,r}
 ```
 
 where each block baseline $\gamma_k^{(b)}$ ($b \in \lbrace \text{box}, 1, \dots, R \rbrace$) starts at $1.0$ ($k = 0$) and updates to
-$\mathrm{clip}(\sigma_{k-1,b}^{sy} / \sigma_{k-1,b}^{yy}, 10^{-10}, 10^{10})$
+$\mathrm{clip}(\sigma_{k-1,b}^{sy} / \sigma_{k-1,b}^{yy}, 10^{-20}, 10^{20})$
 whenever $\sigma_{k-1,b}^{sy} \ge 10^{-3} \sqrt{\sigma_{k-1,b}^{ss} \sigma_{k-1,b}^{yy}}$
-and $\sigma_{k-1,b}^{yy} > 10^{-30}$,
+and $\sigma_{k-1,b}^{yy} > 10^{-100}$,
 otherwise retaining $\gamma_{k-1}^{(b)}$.
-Around the updated box BB2 baseline $\gamma_k^{\text{box}}$, define the condition-bounded coordinatewise trust interval:
-
-```math
-d_{\min,k} = \max\!\bigl(\gamma_{\min}, \, 10^{-3} \gamma_k^{\text{box}}\bigr), \qquad d_{\max,k} = \min\!\bigl(\gamma_{\max}, \, 10^{3} \gamma_k^{\text{box}}\bigr), \qquad \gamma_{\min} = 10^{-10}, \quad \gamma_{\max} = 10^{10}.
-```
-
-At $k = 0$, initialize $D_{0,i} = 1.0$ for $i = 1, \dots, d$.
-After step $k \ge 0$ is accepted with box displacement `s_{k,box}` and gradient difference `y_{k,box}`, update each coordinate $i \in \lbrace 1, \dots, d \rbrace$ (Gilbert--Lemaréchal / L-BFGS-B diagonal secant smoothing):
-- If $s_{k,\text{box},i} \, y_{k,\text{box},i} \ge 10^{-12} s_{k,\text{box},i}^2$
-  and $\lvert y_{k,\text{box},i} \rvert > 10^{-30}$,
-  set $d_{\mathrm{sec},i} = \mathrm{clip}(s_{k,\text{box},i} / y_{k,\text{box},i}, \, d_{\min,k+1}, \, d_{\max,k+1})$,
-  updating $D_{1,i} = d_{\mathrm{sec},i}$ on $k = 0$
-  and $D_{k+1,i} = \mathrm{clip}(0.5 D_{k,i} + 0.5 d_{\mathrm{sec},i}, \, d_{\min,k+1}, \, d_{\max,k+1})$ for $k \ge 1$.
-- Otherwise (e.g., coordinate $i$ remained clamped or had nonpositive 1D curvature),
-  set $D_{1,i} = \gamma_1^{\text{box}}$ on $k = 0$ so initially clamped coordinates inherit the problem's global box scale before release,
-  and set $D_{k+1,i} = \mathrm{clip}(D_{k,i}, \, d_{\min,k+1}, \, d_{\max,k+1})$ for $k \ge 1$.
-
-Because $H_{k,0} = \mathrm{diag}(D_k, \gamma_k^{(1)} I, \dots, \gamma_k^{(R)} I) \succ 0$ has condition number bounded on the box block by $\le 10^6$,
-the masked product operator $\widetilde H_k \succ 0$ preserves strict positive-definiteness unconditionally while preconditioning all $d$ heterogeneous coordinates even when $d \gg m$.
+In `v0.2.1`, replacing non-rotationally-invariant coordinatewise `|s_i / y_i|` seeding with uniform scalar BB2 seeding $D_{k,i} = \gamma_k^{\text{box}}$
+preserves rotational invariance of the L-BFGS seed Hessian $H_{k,0} = \mathrm{diag}(\gamma_k^{\text{box}} I_{\mathcal F}, \gamma_k^{(1)} I, \dots, \gamma_k^{(R)} I) \succ 0$ on rotated/coupled valleys (`B7A`, `B2A`, `B2B`, `B4`, `B5`),
+while the widened trust window $[\gamma_{\min}, \gamma_{\max}] = [10^{-20}, 10^{20}]$ and $10^{-100}$ curvature floors preserve strict objective scale invariance across $f \mapsto \alpha f$ for $\alpha \in [10^{-14}, 10^{12}]$.
 Modularly, the backward/center/forward sweep is factored into a reusable `pure subroutine fc_lbfgs_apply_H` applying $+\widetilde H_k$ to any free-subspace vector `(v_box, V_St, Av_St)` (invoked once for unconstrained box steps and twice for the Rank-1 KKT Nullspace Two-Loop in §2.9).
 
 In the **forward loop** ($j = 1, \dots, m_{\mathrm{cur}}$, over `active_pair_flag(j) == 1`), compute:
@@ -467,10 +451,10 @@ compute the coupled realized box-chord + Stiefel tangent reference variation alo
 ```
 
 Accept $\tau$ iff all three conditions hold:
-1. **Sufficient Negative Chord Slope** (prevents free-set clamping overshoot without Rosen jamming):
+1. **Scale-Invariant Cosine Chord Descent** (prevents free-set clamping overshoot without breaking objective rescaling $f \mapsto \alpha f$):
 
 ```math
-\Delta_k(\tau) \le -10^{-12}\left(\lVert z(\tau) - z_k \rVert_2^2 + \tau^2 \sum_{r=1}^R \lVert \eta_{r,k} \rVert_{X_{r,k}}^2\right) \lt 0.
+\Delta_k(\tau) \le -10^{-12}\, g_0 \left(\lVert z(\tau) - z_k \rVert_2^2 + \tau^2 \sum_{r=1}^R \lVert \eta_{r,k} \rVert_{X_{r,k}}^2\right)^{1/2} \lt 0.
 ```
 
 2. **Callback Evaluation & Domain Guard**: `n_eval < opts%max_eval`, callback returns `rc == 0`, and `ieee_is_finite(f_trial)` holds. (If `rc > 0` or `NaN`/`Inf`, halve $\tau \leftarrow 0.5\tau$; if `rc < 0`, abort immediately with `FC_ERR_CALLBACK_ABORT`.)
@@ -533,7 +517,7 @@ strictly implies Euclidean tangent residual $\le \varepsilon_{\text{gtol}}$. All
 | :--- | :---: | :--- |
 | `FC_SUCCESS_QUERY` | `0` | Workspace query (`lwork == -1` or `liwork == -1`) completed cleanly without touching iterates. |
 | `FC_CONVERGED_GRAD` | `1` | $\mathcal E_{\text{KKT}}(p_k) \le \varepsilon_{\text{gtol}}$ via `opts%gtol` (primary KKT optimality certificate; default `1.0e-6`). |
-| `FC_CONVERGED_FTOL` | `2` | $\lvert f_k - f_{k-1} \rvert \le \varepsilon_{\text{ftol,eff}} \max(1, \lvert f_k \rvert, \lvert f_{k-1} \rvert)$ (honoring explicit `opts%ftol` when `gtol == 0` or `ftol > 1e-13`; sub-2-ULP IEEE-754 roundoff safeguard `2 * FC_EPS` over 16 stalled steps when `gtol > 0` and default `ftol = 1e-14`). |
+| `FC_CONVERGED_FTOL` | `2` | $\lvert f_k - f_{k-1} \rvert \le \varepsilon_{\text{ftol,eff}} \, f_{\text{scale}}$ (honoring explicit `opts%ftol` when `gtol == 0` or `ftol > 1e-13`; sub-2-ULP IEEE-754 noise-floor safeguard `2 * FC_EPS` over 64 stalled steps with scale-invariant `f_scale = max(|f_k|, |f_{k-1}|)` when `gtol > 0` and default `ftol = 1e-14`, preventing premature exit before the 53-bit Hermite slope rule finishes converging to `gtol`). |
 | `FC_CONVERGED_XTOL` | `3` | $\max\bigl(\lVert z_k - z_{k-1} \rVert_\infty, \max_r \lVert X_{r,k} - X_{r,k-1} \rVert_{\mathrm F}\bigr) \le \varepsilon_{\text{xtol,eff}} \max(1, \lVert z_k \rVert_\infty, \sqrt{\max_r p_r})$ (explicit `opts%xtol` when `gtol == 0` or `xtol > 1e-13`; sub-2-ULP safeguard `2 * FC_EPS` over 16 stalled steps at default `1e-14`). |
 | `FC_MAX_ITER_REACHED` | `4` | `k == opts%max_iter` reached with valid feasible iterate $p_k$. |
 | `FC_MAX_EVAL_REACHED` | `5` | `n_eval == opts%max_eval` hard budget hit (`n_eval` never exceeds `max_eval`; returns best accepted $p_k$). |
@@ -685,6 +669,12 @@ where $\mathcal C = \left\lbrace z \in \mathbb R^d : l_i \le z_i \le u_i, \; a^\
      and recompute $\tilde d_{\mathrm{free}}$ once
      so $d_{z,k} \in T_{\mathcal C}(z_k)$
      and $\dot z(0^+) = d_{z,k}$ holds exactly on `(0, tau_brk]`.
+   - **Active-Bound Outward Hold & Stiefel History Preservation (`v0.2.1`)**:
+     On `has_lin_eq .and. used_qn`, before entering `ls_loop`, populate `z_spg(1:d)` with an outward multiplier hold `dz(i) - gam_act * ghat_i` strictly on `FC_BOX_ACTIVE` coordinates whose reduced gradient `ghat_i` points outward.
+     For $\tau \le \tau_{\mathrm{brk,min}}$ this leaves the trial step unchanged,
+     while for $\tau > \tau_{\mathrm{brk,min}}$ it prevents `fc_box_lin_project`'s uniform multiplier shift
+     $-\nu_{\mathrm{proj}} a_i$ from ripping active-bound coordinates off their walls (eliminating boundary lift-off ping-pong on tightly capped simplices like `B8B`, while allowing genuine bound release whenever
+     $\lvert \nu_{\mathrm{proj}} a_i \rvert$ exceeds the active multiplier). Moreover, box-only active-face degeneracy (`fallback_spg` or box stagnation) invokes an isotropic SPG step **without** flushing Stiefel L-BFGS history (`m_cur`), reserving full history flushes for genuine descent or line-search failures.
    - **Isotropic Spectral Projected Gradient (`SPG`) + Stiefel ABB Fallback**:
      Whenever `m_cur == 0`, `memory == 0`, $\langle \tilde a, \tilde w \rangle_{p_k} \le 10^{-30} \lVert \tilde a \rVert_2^2$,
      or $\phi'(0^+) > -10^{-12} v_0 g_0$ (e.g., releasing from a stationary face or simplex corner), or on the second-chance line-search restart, compute:
@@ -1159,37 +1149,27 @@ f(z, X) = 10^4 z_1 (1 + x_{11}) + \frac{1}{2}\mathrm{tr}(X^\top D X)
 
 ### 5.3 Lean 4 Formal Verification (`formalization/Fortchuck.lean`)
 
-Using the cached `leanprover/lean4:v4.34.0-rc2` + Mathlib4 (`de2ef68216c6074f338c8e61890ee0a379ddfb9b`) toolchain via interactive `lean-lsp` MCP verification (`0 sorry`, `0` warnings), `formalization/Fortchuck.lean` proves **seven** machine-checked theorems:
+Using the cached `leanprover/lean4:v4.34.0-rc2` + Mathlib4 (`de2ef68216c6074f338c8e61890ee0a379ddfb9b`) toolchain via interactive `lean-lsp` MCP verification (`2,074` lines, `0 sorry`, `0` custom axioms, `0` warnings, `0` orphan definitions), `formalization/Fortchuck.lean` proves **15** machine-checked theorems organized across 7 foundational pillars (all individually audited with `lean_verify` to depend solely on `[propext, Classical.choice, Quot.sound]`):
 
-1. **Theorem 1 (`skew_generator_properties`)**: For orthonormal `X` ($X^\top X = 1$) and skew tangent `xi` (`X^T xi + xi^T X = 0`), setting `xi_tilde = xi - (1/2) X (X^T xi)` and `W_xi = xi_tilde X^T - X xi_tilde^T` satisfies $W_\xi^\top = -W_\xi$ and `W_xi X = xi`.
-2. **Theorem 2 (`cayley_rotor_orthogonality_and_isometry`)**: Given $W^\top = -W$ and inverse witness `M * (1 - (tau/2) W) = (1 - (tau/2) W) * M = 1`, the Cayley rotor `Q = M * (1 + (tau/2) W)` satisfies `Q = 2 M - 1`, $Q^\top Q = 1$, `(Q X)^T (Q X) = X^T X`, and preserves tangent skew-symmetry and canonical inner products.
-3. **Theorem 3 (`schur_woodbury_cayley_orthogonality`)**: Given $X^\top X = 1$, `A^T = -A`, `X^T K = 0`, `J = 1 - (tau/2) A + (tau^2/4) K^T K`, and `J W = W J = 1`, the rank $2p$ Schur-Woodbury retraction `Y = (2 X + tau K) W - X` satisfies $Y^\top Y = 1$ identically.
-4. **Theorem 4 (`cayley_branch_a_eq_branch_b`)**: Proves exact algebraic equivalence between the Branch A Schur-Woodbury retraction/transport and the Branch B Direct LU resolvent Cayley operator.
-5. **Theorem 5 (`coupled_two_metric_strict_descent`)**: Formalizes Theorem 2.1's coordinatewise free-set clamping inequality `g_i * dot_z_i <= g_i * d_i` under the Bertsekas active-band sign hypothesis, proving:
+1. **Theorem 1 (`skew_generator_properties`)**: For orthonormal `X` ($X^\top X = 1$) and skew tangent `xi` (`X^T xi + xi^T X = 0`), `W_xi = skewGenerator X xi` satisfies $W_\xi^\top = -W_\xi$ and `W_xi X = xi`.
+2. **Theorem 2 (`cayley_resolvent_isUnit`, `cayley_rotor_orthogonality_and_isometry`)**: Proves **unconditional invertibility** `IsUnit (1 - (tau/2) W)` for all $W^\top = -W$ and all $\tau \in \mathbb R$ (zero inverse-witness assumptions), and proves `Q = cayleyRotor W tau` satisfies resolvent doubling `Q = 2 M - 1`, two-sided orthogonality $Q^\top Q = Q Q^\top = 1$, Stiefel retraction preservation `(Q X)^T (Q X) = X^T X`, and exact isometric invariance of tangent skew-symmetry, skew projections, Frobenius cross-Gramians, and `stiefelInner (1 / 2)`.
+3. **Theorem 3 (`schur_woodbury_isUnit`, `schur_woodbury_cayley_orthogonality`)**: Proves **unconditional invertibility** `IsUnit (schurWoodburyMatrix A K tau)` for all $A^\top = -A$ and $\tau \in \mathbb R$, and proves `Y = schurWoodburyRetract X K A tau` satisfies $Y^\top Y = 1$ identically.
+4. **Theorem 4 (`cayley_branch_a_eq_branch_b`, `cayley_branch_a_transport_eq_branch_b`, `schur_woodbury_transport_isometry`)**: Proves exact algebraic equivalence between Branch A Schur-Woodbury and Branch B Direct LU for **both** retraction (`Q * X = Y`) and single-vector / batched-panel vector transport (`Q * zeta = schurWoodburyTransport X xi tau zeta` for arbitrary $\zeta \in \mathbb R^{n \times q}$), certifying exact canonical isometry of `fc_cayley_transport_branch_a` and `fc_cayley_transport_batch_branch_a`.
+5. **Theorem 5 (`lbfgs_two_loop_symm_posDef_bound`, `coupled_two_metric_strict_descent`, `masked_lbfgs_coupled_strict_descent`)**: Proves inductively that the matrix-free filtered two-loop L-BFGS recursion (`lbfgsTwoLoop`, matching `fc_lbfgs_apply_H` + `filter_free_subspace_pairs`) preserves linearity, symmetry, and strict positive-definiteness with an explicit closed-form lower eigenvalue bound $\lambda_{\min} > 0$, then instantiates it directly into Theorem 2.1 to remove the `h_free_pd` assumption and certify:
 
 ```math
-\phi'(0^+) \le -\gamma_{\min} \sum_{i \in \mathcal A^{\text{int}}} g_i^2 - \lambda_{\min} \lVert \tilde g \rVert^2 \le 0.
+\phi'(0^+) \le -\gamma_{\min} \sum_{i \in \mathcal A^{\text{int}}} g_i^2 - \lambda_{\min} \lVert \tilde g \rVert^2 \le 0, \qquad \phi'(0^+) = 0 \iff \mathrm{IsCoupledKKTStationary}(z, X).
 ```
 
-6. **Theorem 6 (`simplex_box_projection_variational`, `v0.2.0` Pillar 4)**: Over `Fin d -> ℝ`, if `∀ i, l i ≤ u i`,
-   $z^\ast_i = \min\bigl(u_i, \max(l_i, y_i - \nu a_i)\bigr)$,
-   and $\sum_{i=1}^d a_i z^\ast_i = b$,
-   then for every feasible $z \in \mathcal C$ satisfying $l_i \le z_i \le u_i$
-   and $\sum_i a_i z_i = b$:
-   (a) $l_i \le z^\ast_i \le u_i$;
-   (b) $\sum_{i=1}^d (y_i - z^\ast_i)(z_i - z^\ast_i) \le 0$;
-   (c) $\sum_{i=1}^d (z^\ast_i - y_i)^2 + \sum_{i=1}^d (z_i - z^\ast_i)^2 \le \sum_{i=1}^d (z_i - y_i)^2$ (unique Euclidean projection); and
-   (d) when $y = z_k - \gamma g$ with $\gamma > 0$
-   and feasible $z_k \in \mathcal C$,
-   the isotropic `SPG` direction $d_{\mathrm{SPG}} = z^\ast - z_k$
-   satisfies $\sum_i a_i d_{\mathrm{SPG},i} = 0$
-   and $\sum_i g_i d_{\mathrm{SPG},i} \le -\tfrac{1}{\gamma} \sum_i d_{\mathrm{SPG},i}^2 \le 0$
-   (strictly $\lt 0$ whenever $z^\ast \neq z_k$).
-7. **Theorem 7 (`rank1_kkt_nullspace_quasinewton_descent`, `v0.2.0` Pillar 4)**: Over `Matrix (Fin n) (Fin n) ℝ`, for any symmetric positive-definite matrix $H$ ($H^\top = H$ and $\forall v \neq 0, \; v^\top H v > 0$) and nonzero $a \neq 0$, defining $u = -H g$, $w = H a$, and $d = u - \frac{a^\top u}{a^\top w} w = -H_{\mathrm{proj}} g$ (via witness $v = g - \frac{a^\top H g}{a^\top H a} a$ satisfying $v^\top H v = -g^\top d$):
-   (a) $a^\top w > 0$;
-   (b) $a^\top d = 0$ (exact hyperplane tangency);
-   (c) multiplier shift invariance $-H_{\mathrm{proj}}(g + \mu a) = d$ for all $\mu \in \mathbb R$; and
-   (d) $g^\top d \le 0$, with strict descent $g^\top d \lt 0$ whenever $\forall \mu \in \mathbb R, \; g \neq \mu a$.
+6. **Theorem 6 (`simplex_box_dual_root_exists`, `simplex_box_projection_variational`, `coupled_spg_stiefel_strict_descent`)**: Proves the exact feasibility certificate $\mathcal C \neq \emptyset \iff \underline b \le b \le \overline b$ (`fc_box_lin_validate`), unconditional dual root existence via continuity and IVT (`fc_box_lin_project`), primal feasibility, variational optimality, strong-convexity unique Euclidean projection,
+   dual shift invariance $P_{\mathcal C}(y + \mu a) = P_{\mathcal C}(y)$, isotropic `SPG` tangency and descent,
+   and unconditional coupled `SPG` $\times$ Stiefel `ABB` strict descent on $\mathcal C \times \prod_r \mathrm{St}(n_r, p_r)$ (`fc_spg_lin_direction`).
+7. **Theorem 7 (`rank1_kkt_nullspace_quasinewton_descent`)**: Over `Matrix (Fin n) (Fin n) ℝ`, for any symmetric positive-definite matrix $H$ ($H^\top = H$ and $\forall v \neq 0, \; v^\top H v > 0$) and nonzero $a \neq 0$, proves using `kktNullspaceStep` and `kktNullspaceStepInhom`:
+   (a) $a^\top H a > 0$;
+   (b) exact homogeneous and inhomogeneous tangency ($a^\top d = 0$ and $a^\top d_{\mathrm{inhom}} = \delta_b$);
+   (c) multiplier shift invariance $d_{\mathrm{KKT}}(g + \mu a) = d_{\mathrm{KKT}}(g)$ for all $\mu \in \mathbb R$;
+   (d) homogeneous descent $g^\top d = -v^\top H v \le 0$ (strictly $\lt 0$ iff $\forall \mu, g \neq \mu a$); and
+   (e) the explicit inhomogeneous directional-derivative identity $g^\top d_{\mathrm{inhom}} = -v^\top H v + \tfrac{\delta_b}{a^\top H a}(g^\top H a)$ and exact descent threshold, documenting why `fc_solve_core` guards nonzero boundary snaps with a runtime directional-derivative check and fallback to Theorem 6 coupled `SPG`.
 
 ### 5.4 Automated Repository & CI Gates
 
@@ -1201,10 +1181,10 @@ Using the cached `leanprover/lean4:v4.34.0-rc2` + Mathlib4 (`de2ef68216c6074f338
 
 ## 6. Strictly Blind Multi-Seed Benchmark Architecture
 
-### 6.1 Blind Evaluation Firewall, Three-Suite Seed Protocol (`101..110`, `201..210`, `301..310`), and Referee (`benchmarks/referee.py`)
+### 6.1 Blind Evaluation Firewall, Four-Suite Seed Protocol (`101..110`, `201..210`, `301..310`, `401..410`), and Referee (`benchmarks/referee.py`)
 
-To guarantee zero data leakage and publication-grade empirical rigor across both `v0.1.0` and `v0.2.0`:
-1. **Single Frozen Default Configuration**: `fortchuck` is called across **all** 11 benchmark instances (`B1..B8B`) and **all** 30 random seeds (`330` runs total: Primary `101..110`, Second Holdout `201..210`, and untouched **Third Blind Holdout `301..310`**) using `FCOptions()` out-of-the-box (`memory=7`, `metric=FC_METRIC_CANONICAL`, `damping_mode=FC_DAMP_CAUTIOUS`, `eps_band=1e-4`), setting **only** `gtol = 1.0e-6` and `max_eval = 5000` (passing `linear_constraint=(problem.lin_a, problem.lin_b)` automatically when `problem.lin_a is not None`). Zero problem-specific parameters, warm-starts, or custom scalings are permitted.
+To guarantee zero data leakage and publication-grade empirical rigor across `v0.1.0`, `v0.2.0`, and `v0.2.1`:
+1. **Single Frozen Default Configuration & Virgin Holdout Firewall**: `fortchuck` is called across **all** 11 benchmark instances (`B1..B8B`) and **all** 40 random seeds (`440` runs total: Primary `101..110`, Second Holdout `201..210`, Third Holdout `301..310`, and the **virgin Fourth Blind Holdout `401..410`**, kept 100% untouched until all `v0.2.1` solver edits were frozen and passed every unit/sanitizer gate) using `FCOptions()` out-of-the-box (`memory=7`, `metric=FC_METRIC_CANONICAL`, `damping_mode=FC_DAMP_CAUTIOUS`, `eps_band=1e-4`), setting **only** `gtol = 1.0e-6` and `max_eval = 5000` (passing `linear_constraint=(problem.lin_a, problem.lin_b)` automatically when `problem.lin_a is not None`). Paired two-sided Wilcoxon signed-rank `p`-values include explicit polarity tags (`FC better` / `FC worse` / `tie`). Zero problem-specific parameters, warm-starts, or custom scalings are permitted.
 2. **Bit-Identical Seed Preservation + Constrained Referee**: For `B1..B7B` (`lin_a is None`), `generate_initial_point(problem, seed)` preserves the exact `v0.1.0` `PCG64(seed)` RNG draw sequence bit-for-bit. When `lin_a is not None` (`B8A`, `B8B`), `z0` is projected onto the central $80\%$ sub-box $\lbrack l + 0.1(u-l), \, u - 0.1(u-l) \rbrack \cap \lbrace a^\top z = b \rbrace$ via an **independent pure-NumPy** bisection/secant routine `project_linear_box_ref` (never calling `fortchuck`!) so both projection and interior/warping baselines start from the exact same strictly interior feasible point. On every returned `(z, X)`, the independent referee evaluates ($\mathcal D = \mathcal B$ when `lin_a is None`, $\mathcal D = \mathcal C$ when `lin_a is not None`):
 
 ```math

@@ -1,4 +1,4 @@
-"""Strictly blind multi-seed benchmark runner and statistical referee for fortchuck (v0.2.0).
+"""Strictly blind multi-seed benchmark runner and statistical referee for fortchuck (v0.2.1).
 
 Evaluates:
   1. `fortchuck` using strictly frozen out-of-the-box `FCOptions(gtol=1e-6, max_eval=5000)`
@@ -10,14 +10,16 @@ Evaluates:
      `SciPy-SLSQP`, `SciPy-trust-constr`) initialized from bit-identical
      `PCG64(seed)` feasible points `(z0, X0_list)`.
 
-By default, runs ALL THREE blind seed suites across all 11 problems (`B1..B8B`):
+By default, runs ALL FOUR blind seed suites across all 11 problems (`B1..B8B`):
   - Primary Blind Suite (`101..110`, 110 runs/solver)
   - Out-of-Sample Holdout Suite (`201..210`, 110 runs/solver)
-  - Untouched Third Blind Holdout Suite (`301..310`, 110 runs/solver)
-totaling 30 seeds (330 runs/solver), computing independent referee solve rates
+  - Third Blind Holdout Suite (`301..310`, 110 runs/solver)
+  - Virgin Fourth Blind Holdout Suite (`401..410`, 110 runs/solver)
+totaling 40 seeds (440 runs/solver), computing independent referee solve rates
 (`E_KKT_ref <= 1e-6` and `max(V_box, V_lin, V_orth) <= 1e-8`), median/IQR evaluations
 & wall-clock ms, median `E_KKT_ref`, `V_box`, `V_lin`, `V_orth`, certified global
-optimality gap `f - f_star` on `B6` and `B7B`, and paired Wilcoxon signed-rank `p`-values.
+optimality gap `f - f_star` on `B6` and `B7B`, and directional paired Wilcoxon
+signed-rank `p`-values.
 
 Note: `fortchuck` is imported lazily ONLY when `"fortchuck"` or `"fortchuck-ABB"` is
 requested in `solver_names`, preserving the Stage A pre-solver blind firewall.
@@ -57,9 +59,10 @@ from benchmarks.problems import (  # noqa: E402
 )
 from benchmarks.referee import (  # noqa: E402
     BLIND3_SEEDS,
+    BLIND4_SEEDS,
     HOLDOUT_SEEDS,
     PRIMARY_SEEDS,
-     generate_initial_point,
+    generate_initial_point,
     parse_seeds,
     verify_all_analytical_gradients,
 )
@@ -110,6 +113,34 @@ def _safe_wilcoxon(
         return pval if np.isfinite(pval) else 1.0
     except ValueError:
         return 1.0
+
+
+def _wilcoxon_with_direction(
+    fc_vals: Sequence[float],
+    other_vals: Sequence[float],
+) -> tuple[float | None, float | None, float | None, str | None]:
+    """Return `(p_two_sided, p_less, p_greater, direction)` for lower-is-better paired metrics.
+
+    Direction is determined strictly from the one-sided signed-rank tests on
+    `diff = fc_vals - other_vals`:
+      - `"fc_better"` when `p_less < p_greater` (signed-rank sum favors `fortchuck < baseline`),
+      - `"fc_worse"` when `p_greater < p_less` (signed-rank sum favors `fortchuck > baseline`),
+      - `"tie"` otherwise.
+    """
+    p_two = _safe_wilcoxon(fc_vals, other_vals, alternative="two-sided")
+    if p_two is None:
+        return None, None, None, None
+    p_less = _safe_wilcoxon(fc_vals, other_vals, alternative="less")
+    p_greater = _safe_wilcoxon(fc_vals, other_vals, alternative="greater")
+    if p_less is None or p_greater is None:
+        return p_two, p_less, p_greater, "tie"
+    if p_less < p_greater:
+        direction = "fc_better"
+    elif p_greater < p_less:
+        direction = "fc_worse"
+    else:
+        direction = "tie"
+    return p_two, p_less, p_greater, direction
 
 
 def _median_and_iqr(values: Sequence[float]) -> tuple[float, float, float, float]:
@@ -181,7 +212,12 @@ def _aggregate_problem_solver(
             "f_gap_abs_max": None,
             "wilcoxon_evals_two_sided_p": None,
             "wilcoxon_evals_less_p": None,
+            "wilcoxon_evals_greater_p": None,
+            "wilcoxon_evals_direction": None,
             "wilcoxon_kkt_two_sided_p": None,
+            "wilcoxon_kkt_less_p": None,
+            "wilcoxon_kkt_greater_p": None,
+            "wilcoxon_kkt_direction": None,
         }
 
     n_solved = sum(1 for r in runs if r.audit.solved)
@@ -229,13 +265,21 @@ def _aggregate_problem_solver(
 
     p_eval_two: float | None = None
     p_eval_less: float | None = None
+    p_eval_greater: float | None = None
+    dir_eval: str | None = None
     p_kkt_two: float | None = None
+    p_kkt_less: float | None = None
+    p_kkt_greater: float | None = None
+    dir_kkt: str | None = None
     if fc_runs is not None and runs[0].solver_name != "fortchuck":
         fc_pen = [float(r.n_eval if r.audit.solved else max_eval) for r in fc_runs]
         fc_kkt = [float(r.audit.e_kkt_ref) for r in fc_runs]
-        p_eval_two = _safe_wilcoxon(fc_pen, pen_evals, alternative="two-sided")
-        p_eval_less = _safe_wilcoxon(fc_pen, pen_evals, alternative="less")
-        p_kkt_two = _safe_wilcoxon(fc_kkt, kkt_vals, alternative="two-sided")
+        p_eval_two, p_eval_less, p_eval_greater, dir_eval = _wilcoxon_with_direction(
+            fc_pen, pen_evals
+        )
+        p_kkt_two, p_kkt_less, p_kkt_greater, dir_kkt = _wilcoxon_with_direction(
+            fc_kkt, kkt_vals
+        )
 
     return {
         "skipped": False,
@@ -270,7 +314,12 @@ def _aggregate_problem_solver(
         "f_gap_abs_max": fg_abs_max,
         "wilcoxon_evals_two_sided_p": p_eval_two,
         "wilcoxon_evals_less_p": p_eval_less,
+        "wilcoxon_evals_greater_p": p_eval_greater,
+        "wilcoxon_evals_direction": dir_eval,
         "wilcoxon_kkt_two_sided_p": p_kkt_two,
+        "wilcoxon_kkt_less_p": p_kkt_less,
+        "wilcoxon_kkt_greater_p": p_kkt_greater,
+        "wilcoxon_kkt_direction": dir_kkt,
     }
 
 
@@ -330,18 +379,27 @@ def _aggregate_suite_runs(
 
         p_ev_two = None
         p_ev_less = None
+        p_ev_greater = None
+        dir_ev = None
         p_wm_two = None
+        dir_wm = None
         p_kkt_two = None
+        p_kkt_less = None
+        p_kkt_greater = None
+        dir_kkt = None
         if has_fc and s_name != "fortchuck" and fc_paired_runs:
             fc_pen_all = [
                 float(r.n_eval if r.audit.solved else max_eval) for r in fc_paired_runs
             ]
             fc_wm_all = [float(r.wall_ms) for r in fc_paired_runs]
             fc_kkt_all = [float(r.audit.e_kkt_ref) for r in fc_paired_runs]
-            p_ev_two = _safe_wilcoxon(fc_pen_all, pen_ev, alternative="two-sided")
-            p_ev_less = _safe_wilcoxon(fc_pen_all, pen_ev, alternative="less")
-            p_wm_two = _safe_wilcoxon(fc_wm_all, wall_all, alternative="two-sided")
-            p_kkt_two = _safe_wilcoxon(fc_kkt_all, kkt_all, alternative="two-sided")
+            p_ev_two, p_ev_less, p_ev_greater, dir_ev = _wilcoxon_with_direction(
+                fc_pen_all, pen_ev
+            )
+            p_wm_two, _, _, dir_wm = _wilcoxon_with_direction(fc_wm_all, wall_all)
+            p_kkt_two, p_kkt_less, p_kkt_greater, dir_kkt = _wilcoxon_with_direction(
+                fc_kkt_all, kkt_all
+            )
 
         overall_by_solver[s_name] = {
             "n_total_slots": total_slots,
@@ -366,8 +424,14 @@ def _aggregate_suite_runs(
             "v_orth_median": vo_med,
             "wilcoxon_evals_two_sided_p": p_ev_two,
             "wilcoxon_evals_less_p": p_ev_less,
+            "wilcoxon_evals_greater_p": p_ev_greater,
+            "wilcoxon_evals_direction": dir_ev,
             "wilcoxon_wall_ms_two_sided_p": p_wm_two,
+            "wilcoxon_wall_ms_direction": dir_wm,
             "wilcoxon_kkt_two_sided_p": p_kkt_two,
+            "wilcoxon_kkt_less_p": p_kkt_less,
+            "wilcoxon_kkt_greater_p": p_kkt_greater,
+            "wilcoxon_kkt_direction": dir_kkt,
         }
 
     return by_problem_summary, overall_by_solver
@@ -377,6 +441,21 @@ def _fmt_sci(val: float | None, digits: int = 2) -> str:
     if val is None or not np.isfinite(val):
         return "N/A"
     return f"{val:.{digits}e}"
+
+
+def _fmt_wilcoxon(val: float | None, direction: str | None) -> str:
+    """Format two-sided Wilcoxon p-value with explicit direction relative to fortchuck."""
+    if val is None or not np.isfinite(val):
+        return "N/A"
+    tag_map = {
+        "fc_better": "FC better",
+        "fc_worse": "FC worse",
+        "tie": "tie",
+    }
+    tag = tag_map.get(direction or "")
+    if tag is None:
+        return f"{val:.2e}"
+    return f"{val:.2e} ({tag})"
 
 
 def _fmt_med_iqr(med: float | None, iqr: float | None, decimals: int = 1) -> str:
@@ -418,8 +497,20 @@ def _append_overall_table(
         kkt_str = _fmt_sci(ov["e_kkt_ref_median"])
         vlin_str = _fmt_sci(ov.get("v_lin_max"))
         orth_str = _fmt_sci(ov["v_orth_median"])
-        p_ev = "—" if s_name == "fortchuck" else _fmt_sci(ov["wilcoxon_evals_two_sided_p"])
-        p_kkt = "—" if s_name == "fortchuck" else _fmt_sci(ov["wilcoxon_kkt_two_sided_p"])
+        p_ev = (
+            "—"
+            if s_name == "fortchuck"
+            else _fmt_wilcoxon(
+                ov["wilcoxon_evals_two_sided_p"], ov.get("wilcoxon_evals_direction")
+            )
+        )
+        p_kkt = (
+            "—"
+            if s_name == "fortchuck"
+            else _fmt_wilcoxon(
+                ov["wilcoxon_kkt_two_sided_p"], ov.get("wilcoxon_kkt_direction")
+            )
+        )
         lines.append(
             f"| `{s_name}` | {n_eval_runs} | {n_solved} | {rate_pct:.1f}% | {pev_str} | {wm_str} | `{kkt_str}` | `{vlin_str}` | `{orth_str}` | `{p_ev}` | `{p_kkt}` |"
         )
@@ -471,7 +562,13 @@ def _append_per_problem_section(
             vl = _fmt_sci(st.get("v_lin_median", 0.0))
             vo = _fmt_sci(st["v_orth_median"])
             fv = f"{st['f_val_median']:.6f}" if st["f_val_median"] is not None else "N/A"
-            wp = "—" if s_name == "fortchuck" else _fmt_sci(st["wilcoxon_evals_two_sided_p"])
+            wp = (
+                "—"
+                if s_name == "fortchuck"
+                else _fmt_wilcoxon(
+                    st["wilcoxon_evals_two_sided_p"], st.get("wilcoxon_evals_direction")
+                )
+            )
             lines.append(
                 f"| `{s_name}` | {sr} | {rev} | {pev} | {wm} | `{kkt}` | `{vb}` | `{vl}` | `{vo}` | `{fv}` | `{wp}` |"
             )
@@ -489,10 +586,11 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
     per_prob: dict[str, dict[str, Any]] = summary["by_problem"]
     holdout: dict[str, Any] | None = summary.get("holdout")
     blind3: dict[str, Any] | None = summary.get("blind3")
+    blind4: dict[str, Any] | None = summary.get("blind4")
     pooled: dict[str, Any] | None = summary.get("combined_pooled")
 
     lines: list[str] = []
-    lines.append("# Blind Multi-Seed Benchmark Report (`fortchuck` v0.2.0)")
+    lines.append("# Blind Multi-Seed Benchmark Report (`fortchuck` v0.2.1)")
     lines.append("")
     lines.append("## 1. Blind Evaluation Protocol and Referee Specification")
     lines.append("")
@@ -513,7 +611,12 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
     if blind3 is not None:
         b3_seeds = blind3["config"]["seeds"]
         suite_descs.append(
-            f"`{len(b3_seeds)}` untouched third blind holdout seeds (`{_seed_range_label(b3_seeds)}`)"
+            f"`{len(b3_seeds)}` third blind holdout seeds (`{_seed_range_label(b3_seeds)}`)"
+        )
+    if blind4 is not None:
+        b4_seeds = blind4["config"]["seeds"]
+        suite_descs.append(
+            f"`{len(b4_seeds)}` virgin fourth blind holdout seeds (`{_seed_range_label(b4_seeds)}`)"
         )
     lines.append(
         f"- **Multi-Suite Deterministic Initializations**: Initial feasible iterates are generated via `PCG64` across {', '.join(suite_descs)}. On linearly constrained problems (`B8A`, `B8B`), initial Euclidean draws are projected onto the central 80% sub-box intersected with $a^\\top z = b$ via `project_linear_box_ref` so every solver starts from the exact same strictly interior feasible point."
@@ -546,7 +649,7 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
         )
         lines.append("")
         lines.append(
-            "Pooled aggregate metrics across all executed blind seed suites (`Penalized Evals` assigns `max_eval = 5000` to unsolved runs; paired two-sided Wilcoxon signed-rank `p`-values compare `fortchuck` against each baseline across shared non-skipped runs):"
+            "Pooled aggregate metrics across all executed blind seed suites (`Penalized Evals` assigns `max_eval = 5000` to unsolved runs; directional two-sided paired Wilcoxon signed-rank `p`-values compare `fortchuck` against each baseline across shared non-skipped runs, where `FC better` means the signed-rank sum favors lower/better values for `fortchuck`, `FC worse` favors the baseline, and `tie` indicates equal signed-rank sums):"
         )
         lines.append("")
         _append_overall_table(lines, solvers, pooled["overall_by_solver"])
@@ -581,14 +684,28 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
         b3_seeds = blind3["config"]["seeds"]
         b3_label = _seed_range_label(b3_seeds)
         lines.append(
-            f"## {sec_num}. Untouched Third Blind Holdout Suite Aggregate Summary (`Seeds {b3_label}`)"
+            f"## {sec_num}. Third Blind Holdout Suite Aggregate Summary (`Seeds {b3_label}`)"
         )
         lines.append("")
         lines.append(
-            f"Aggregate metrics across the untouched third blind holdout suite (`{b3_label}`) under the identical frozen `FCOptions(gtol=1.0e-6, max_eval=5000)` configuration:"
+            f"Aggregate metrics across the third blind holdout suite (`{b3_label}`) under the identical frozen `FCOptions(gtol=1.0e-6, max_eval=5000)` configuration:"
         )
         lines.append("")
         _append_overall_table(lines, solvers, blind3["overall_by_solver"])
+        sec_num += 1
+
+    if blind4 is not None:
+        b4_seeds = blind4["config"]["seeds"]
+        b4_label = _seed_range_label(b4_seeds)
+        lines.append(
+            f"## {sec_num}. Virgin Fourth Blind Holdout Suite Aggregate Summary (`Seeds {b4_label}`)"
+        )
+        lines.append("")
+        lines.append(
+            f"Aggregate metrics across the virgin fourth blind holdout suite (`{b4_label}`), held completely untouched until all `src/*.f90` edits were frozen, under the identical `FCOptions(gtol=1.0e-6, max_eval=5000)` configuration:"
+        )
+        lines.append("")
+        _append_overall_table(lines, solvers, blind4["overall_by_solver"])
         sec_num += 1
 
     # Ground-truth global optimality verification table for B6 and B7B
@@ -621,6 +738,9 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
         if blind3 is not None:
             b3_label = _seed_range_label(blind3["config"]["seeds"])
             suites_for_gt.append((f"Blind3 (`{b3_label}`)", blind3["by_problem"]))
+        if blind4 is not None:
+            b4_label = _seed_range_label(blind4["config"]["seeds"])
+            suites_for_gt.append((f"Blind4 (`{b4_label}`)", blind4["by_problem"]))
 
         for suite_tag, pp_map in suites_for_gt:
             for pm in gt_probs:
@@ -645,8 +765,9 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
         and pooled is not None
         and holdout is not None
         and len(problems_meta) == 11
-        and len(pooled["seeds"]) == 30
+        and len(pooled["seeds"]) >= 30
     ):
+        n_pool = len(pooled["seeds"])
         v010_ref: dict[str, tuple[str, float, float]] = {
             "B1": ("20/20 (100%)", 2084.5, 1813.88),
             "B2A": ("15/20 (75%)", 580.0, 171.27),
@@ -659,19 +780,19 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
             "B7B": ("20/20 (100%)", 504.0, 619.29),
         }
         lines.append(
-            f"## {sec_num}. `v0.1.0` to `v0.2.0` Progression and Zero-FFI Native CLI Telemetry"
+            f"## {sec_num}. `v0.1.0` to `v0.2.1` Progression and Zero-FFI Native CLI Telemetry"
         )
         lines.append("")
         lines.append(
-            "### `v0.1.0` vs `v0.2.0` Progression (`Seeds 101..110 + 201..210` Shared Cohort & `30`-Seed Pool)"
+            f"### `v0.1.0` vs `v0.2.1` Progression (`Seeds 101..110 + 201..210` Shared Cohort & `{n_pool}`-Seed Pool)"
         )
         lines.append("")
         lines.append(
-            "Comparison of frozen out-of-the-box `fortchuck` (`FCOptions(gtol=1.0e-6, max_eval=5000)`) across the 20 shared seeds (`101..110` + `201..210`) from `v0.1.0` alongside the full 30-seed (`+ 301..310`) `v0.2.0` pool:"
+            f"Comparison of frozen out-of-the-box `fortchuck` (`FCOptions(gtol=1.0e-6, max_eval=5000)`) across the 20 shared seeds (`101..110` + `201..210`) from `v0.1.0` alongside the full `{n_pool}`-seed `v0.2.1` pool:"
         )
         lines.append("")
         lines.append(
-            "| Problem | `v0.1.0` Solved (20) | `v0.1.0` Raw Evals Med | `v0.1.0` Wall ms Med | `v0.2.0` Solved (20) | `v0.2.0` Raw Evals Med (20) | `v0.2.0` Wall ms Med (20) | `v0.2.0` Wall Speedup | `v0.2.0` Solved (30 Pool) | `v0.2.0` Max Lin Viol (30) |"
+            f"| Problem | `v0.1.0` Solved (20) | `v0.1.0` Raw Evals Med | `v0.1.0` Wall ms Med | `v0.2.1` Solved (20) | `v0.2.1` Raw Evals Med (20) | `v0.2.1` Wall ms Med (20) | `v0.2.1` Wall Speedup | `v0.2.1` Solved ({n_pool} Pool) | `v0.2.1` Max Lin Viol ({n_pool}) |"
         )
         lines.append(
             "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
@@ -756,11 +877,22 @@ def _render_markdown_report(summary: dict[str, Any]) -> str:
     if blind3 is not None:
         b3_label = _seed_range_label(blind3["config"]["seeds"])
         lines.append(
-            f"## {sec_num}. Per-Problem Breakdown — Untouched Third Blind Holdout Suite (`Seeds {b3_label}`)"
+            f"## {sec_num}. Per-Problem Breakdown — Third Blind Holdout Suite (`Seeds {b3_label}`)"
         )
         lines.append("")
         _append_per_problem_section(
             lines, blind3["problems"], blind3["by_problem"], solvers
+        )
+        sec_num += 1
+
+    if blind4 is not None:
+        b4_label = _seed_range_label(blind4["config"]["seeds"])
+        lines.append(
+            f"## {sec_num}. Per-Problem Breakdown — Virgin Fourth Blind Holdout Suite (`Seeds {b4_label}`)"
+        )
+        lines.append("")
+        _append_per_problem_section(
+            lines, blind4["problems"], blind4["by_problem"], solvers
         )
 
     return "\n".join(lines) + "\n"
@@ -959,6 +1091,7 @@ def run_suite(
     seeds: Sequence[int],
     holdout_seeds: Sequence[int] | None = None,
     blind3_seeds: Sequence[int] | None = None,
+    blind4_seeds: Sequence[int] | None = None,
     problem_ids: Sequence[str],
     solver_names: Sequence[str],
     gtol: float = 1.0e-6,
@@ -967,7 +1100,7 @@ def run_suite(
     timeout_sec: float = 20.0,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Execute the primary, holdout, and third blind holdout benchmark suites."""
+    """Execute the primary, holdout, third, and virgin fourth blind benchmark suites."""
     if ("fortchuck" in solver_names) or ("fortchuck-ABB" in solver_names):
         # Pre-load shared C-ABI library before any wall-clock measurement
         from fortchuck._native import load_native_library
@@ -1028,6 +1161,24 @@ def run_suite(
     else:
         primary_summary["blind3"] = None
 
+    if blind4_seeds:
+        blind4_summary, blind4_runs = _execute_single_suite(
+            suite_label="BLIND4",
+            seeds=blind4_seeds,
+            problems=problems,
+            solver_names=solver_names,
+            gtol=gtol,
+            feas_tol=feas_tol,
+            max_eval=max_eval,
+            timeout_sec=timeout_sec,
+            verbose=verbose,
+        )
+        primary_summary["blind4"] = blind4_summary
+        suite_runs_list.append(blind4_runs)
+        pooled_seed_list.extend(blind4_seeds)
+    else:
+        primary_summary["blind4"] = None
+
     if len(suite_runs_list) > 1:
         pooled_runs: dict[str, dict[str, list[BaselineResult]]] = {
             prob.problem_id: {
@@ -1079,13 +1230,13 @@ def _parse_csv_list(raw: str | None, valid: Sequence[str], kind: str) -> list[st
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the fortchuck v0.2.0 strictly blind multi-seed benchmark suite."
+        description="Run the fortchuck v0.2.1 strictly blind multi-seed benchmark suite."
     )
     parser.add_argument(
         "--smoke",
         action="store_true",
         help=(
-            "Fast deterministic CI smoke mode (defaults to seeds 101 / 201 / 301 across "
+            "Fast deterministic CI smoke mode (defaults to seeds 101 / 201 / 301 / 401 across "
             "B1,B2B,B3,B6,B7A,B7B,B8A,B8B and fortchuck,fortchuck-ABB,Alternating-BCD,SciPy-L-BFGS-B)."
         ),
     )
@@ -1121,7 +1272,21 @@ def main() -> int:
     parser.add_argument(
         "--no-blind3",
         action="store_true",
-        help="Skip untouched third blind holdout suite (301..310).",
+        help="Skip third blind holdout suite (301..310).",
+    )
+    parser.add_argument(
+        "--blind4-seeds",
+        type=str,
+        default="auto",
+        help=(
+            "Virgin fourth blind holdout seed specification (default: 'auto' -> '401..410' "
+            "when --seeds is '101..110', or '401' under --smoke)."
+        ),
+    )
+    parser.add_argument(
+        "--no-blind4",
+        action="store_true",
+        help="Skip virgin fourth blind holdout suite (401..410).",
     )
     parser.add_argument(
         "--problems",
@@ -1197,6 +1362,18 @@ def main() -> int:
     else:
         blind3_seeds = parse_seeds(args.blind3_seeds)
 
+    if args.no_blind4 or not args.blind4_seeds or not args.blind4_seeds.strip():
+        blind4_seeds: list[int] | None = None
+    elif args.blind4_seeds.strip().lower() == "auto":
+        if args.smoke and args.seeds is None:
+            blind4_seeds = [BLIND4_SEEDS[0]]
+        elif raw_seeds.strip() == "101..110":
+            blind4_seeds = list(BLIND4_SEEDS)
+        else:
+            blind4_seeds = None
+    else:
+        blind4_seeds = parse_seeds(args.blind4_seeds)
+
     default_probs = SMOKE_PROBLEM_IDS if (args.smoke and args.problems is None) else BENCHMARK_IDS
     default_solvers = (
         SMOKE_SOLVER_NAMES if (args.smoke and args.solvers is None) else ALL_SOLVER_NAMES
@@ -1216,6 +1393,7 @@ def main() -> int:
         seeds=seeds,
         holdout_seeds=holdout_seeds,
         blind3_seeds=blind3_seeds,
+        blind4_seeds=blind4_seeds,
         problem_ids=problem_ids,
         solver_names=solver_names,
         gtol=args.gtol,

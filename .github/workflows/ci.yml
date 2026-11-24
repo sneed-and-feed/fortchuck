@@ -127,17 +127,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,bench]"
 
-      - name: Verify Central Finite-Difference Gradients & Seed Feasibility (All 3 Suites)
+      - name: Verify Central Finite-Difference Gradients & Seed Feasibility (All 4 Suites)
         run: |
           python -m benchmarks.referee --seeds 101..110
           python -m benchmarks.referee --seeds 201..210
           python -m benchmarks.referee --seeds 301..310
+          python -m benchmarks.referee --seeds 401..410
 
-      - name: Execute Deterministic Blind, Holdout & Blind3 Benchmark Smoke Suite
+      - name: Execute Deterministic Blind, Holdout, Blind3 & Blind4 Benchmark Smoke Suite
         run: |
           python benchmarks/run_blind_suite.py \
             --smoke \
             --json-out /tmp/ci_blind_smoke.json \
             --md-out /tmp/ci_blind_smoke.md
           python scripts/audit_gfm_math.py /tmp/ci_blind_smoke.md
-          python -c "import json; d = json.load(open('/tmp/ci_blind_smoke.json')); assert d['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['overall_by_solver']['fortchuck']; assert d['holdout']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['holdout']['overall_by_solver']['fortchuck']; assert d['blind3']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['blind3']['overall_by_solver']['fortchuck']; assert d['by_problem']['B6']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B6']['fortchuck']; assert d['by_problem']['B7B']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B7B']['fortchuck']; assert d['by_problem']['B8A']['fortchuck']['v_lin_max'] <= 1e-12, d['by_problem']['B8A']['fortchuck']; assert d['by_problem']['B8B']['fortchuck']['v_lin_max'] <= 1e-12, d['by_problem']['B8B']['fortchuck']"
+          python -c "import json; d = json.load(open('/tmp/ci_blind_smoke.json')); assert d['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['overall_by_solver']['fortchuck']; assert d['holdout']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['holdout']['overall_by_solver']['fortchuck']; assert d['blind3']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['blind3']['overall_by_solver']['fortchuck']; assert d['blind4']['overall_by_solver']['fortchuck']['solve_rate_evaluated'] == 1.0, d['blind4']['overall_by_solver']['fortchuck']; assert d['by_problem']['B6']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B6']['fortchuck']; assert d['by_problem']['B7B']['fortchuck']['f_gap_abs_max'] <= 1e-8, d['by_problem']['B7B']['fortchuck']; assert d['by_problem']['B8A']['fortchuck']['v_lin_max'] <= 1e-12, d['by_problem']['B8A']['fortchuck']; assert d['by_problem']['B8B']['fortchuck']['v_lin_max'] <= 1e-12, d['by_problem']['B8B']['fortchuck']"

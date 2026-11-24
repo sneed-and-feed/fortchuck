@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use fortchuck in your research or engineering systems, please cite it using the metadata below."
 title: "fortchuck: Zero-Allocation Coupled Box/Simplex x Stiefel Product-Manifold Quasi-Newton Optimizer"
-version: 0.2.0
-date-released: 2026-11-12
+version: 0.2.1
+date-released: 2026-11-20
 authors:
   - family-names: "Cohen"
     given-names: "Noah"

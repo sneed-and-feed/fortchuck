@@ -23,6 +23,7 @@ from fortchuck import (
     FortchuckWorkspace,
     kkt_residual,
     minimize_box_stiefel,
+    project_linear_box,
     project_stiefel,
 )
 
@@ -496,3 +497,252 @@ def test_fm13_non_isotropic_hyperplane_and_simplex_corner_release(seed: int) -> 
     assert kkt_chk <= 1.0e-9
     assert lin_chk <= 1.0e-14
     assert orth_chk <= 1.0e-13
+
+
+@pytest.mark.parametrize("alpha", [1.0, 1.0e-14, 1.0e12])
+@pytest.mark.parametrize("constrained", [False, True])
+def test_objective_scale_invariance_extreme_alpha(
+    alpha: float, constrained: bool
+) -> None:
+    """Scale invariance under `f -> alpha * f` for `alpha in {1, 1e-14, 1e+12}`.
+
+    Guards against dimensionally inconsistent line-search descent thresholds
+    (`O(||g||*||d||)` vs `O(||d||^2)`) and `z - (z - gz)` KKT cancellation on
+    both unconstrained Box x Stiefel and linearly constrained Simplex x Stiefel.
+    """
+    rng = np.random.default_rng(1234)
+    d = 6
+    n, p = 8, 2
+    Q_d = project_stiefel(np.asfortranarray(rng.standard_normal((d, d))))
+    M = Q_d @ np.diag(np.geomspace(1.0, 20.0, d)) @ Q_d.T
+    M = 0.5 * (M + M.T)
+    z_targ = np.array([0.4, 0.25, -0.2, 0.3, 0.15, 0.5], dtype=np.float64)
+    D_st = np.arange(1.0, n + 1.0, dtype=np.float64)
+
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.ones(d, dtype=np.float64)
+    a_lin = np.ones(d, dtype=np.float64)
+    b_lin = 1.0
+    lin_arg = (a_lin, b_lin) if constrained else None
+
+    z0 = np.full(d, 1.0 / d, dtype=np.float64)
+    X0 = project_stiefel(np.asfortranarray(rng.standard_normal((n, p))))
+
+    def make_fg(scale: float):
+        def fg(
+            z: np.ndarray, xs: list[np.ndarray]
+        ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+            X = xs[0]
+            dz = z - z_targ
+            Mdz = M @ dz
+            f_b = 0.5 * float(np.dot(dz, Mdz))
+            gz = Mdz.copy()
+            cw = np.array([0.5 + float(z[0]), 0.8 + float(z[1])], dtype=np.float64)
+            DX = D_st[:, None] * X
+            cq = np.sum(X * DX, axis=0)
+            f_s = 0.5 * float(np.dot(cw, cq))
+            gz[0] += 0.5 * cq[0]
+            gz[1] += 0.5 * cq[1]
+            GX = np.asfortranarray(DX * cw[None, :])
+            return scale * (f_b + f_s), scale * gz, [scale * GX]
+
+        return fg
+
+    # Reference solution at alpha = 1.0
+    res_ref = minimize_box_stiefel(
+        make_fg(1.0),
+        z0=z0,
+        bounds=(lower, upper),
+        X0_list=X0,
+        options=FCOptions(gtol=1.0e-7, max_iter=500, max_eval=2000),
+        linear_constraint=lin_arg,
+        copy=True,
+    )
+    assert res_ref.status == FC_CONVERGED_GRAD
+
+    fg_scaled = make_fg(alpha)
+    res = minimize_box_stiefel(
+        fg_scaled,
+        z0=z0,
+        bounds=(lower, upper),
+        X0_list=X0,
+        options=FCOptions(gtol=1.0e-7 * alpha, max_iter=500, max_eval=2000),
+        linear_constraint=lin_arg,
+        copy=True,
+    )
+    assert res.status == FC_CONVERGED_GRAD
+    assert res.kkt_residual <= 1.0e-7 * alpha
+    assert res.orth_error <= 1.0e-13
+    assert np.max(np.abs(res.z - res_ref.z)) <= 1.0e-5
+    if constrained:
+        assert abs(float(np.sum(res.z)) - b_lin) <= 1.0e-14
+
+    # Standalone kkt_residual helper parity (cancellation-free even at alpha = 1e-14)
+    _, gz_fin, gx_fin = fg_scaled(res.z, res.X_list)
+    kkt_out = kkt_residual(
+        z=res.z,
+        bounds=(lower, upper),
+        X_list=res.X_list,
+        gz=gz_fin,
+        GX_list=gx_fin,
+        linear_constraint=lin_arg,
+    )
+    kkt_chk = float(kkt_out[0])
+    assert kkt_chk <= 1.0e-7 * alpha
+    assert kkt_chk == pytest.approx(res.kkt_residual, rel=1.0e-6, abs=1.0e-22)
+
+
+@pytest.mark.parametrize("shift_scale", [1.0e4, 1.0e5, -1.0e5])
+@pytest.mark.parametrize("eps_lin", [5.0e-9, -5.0e-9])
+def test_project_initial_zero_small_lin_residual_large_nu_k(
+    shift_scale: float, eps_lin: float
+) -> None:
+    """`project_initial=0` with `0 < |a^T z0 - b| <= 1e-8 * (1 + |b|)` and large `nu_k`.
+
+    Verifies that step-0 directional slope and line-search chord do not inject
+    spurious `nu_k * (b - a^T z0)` bias when `z0` is within initial feasibility
+    tolerance but not exact to machine precision.
+    """
+    rng = np.random.default_rng(77)
+    d = 8
+    n, p = 8, 2
+    a = np.array([1.4, 0.9, 1.2, -0.8, 1.7, -0.5, 1.1, 0.6], dtype=np.float64)
+    b = 2.15
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.ones(d, dtype=np.float64)
+    z_targ = np.array([0.8, 0.2, 0.5, 0.4, 0.9, 0.1, 0.6, 0.3], dtype=np.float64)
+    D_st = np.arange(1.0, n + 1.0, dtype=np.float64)
+
+    z0_exact, _ = project_linear_box(
+        np.full(d, 0.4, dtype=np.float64), lower, upper, a, b
+    )
+    z0 = z0_exact.copy()
+    z0[0] += eps_lin / a[0]
+    assert 1.0e-9 < abs(float(np.dot(a, z0)) - b) < 1.0e-8 * (1.0 + abs(b))
+    X0 = project_stiefel(np.asfortranarray(rng.standard_normal((n, p))))
+
+    def fg(
+        z: np.ndarray, xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X = xs[0]
+        dz = z - z_targ
+        f_b = 0.5 * float(np.dot(dz, dz)) + shift_scale * float(np.dot(a, z))
+        gz = dz + shift_scale * a
+        DX = D_st[:, None] * X
+        f_s = 0.5 * float(np.sum(X * DX)) * (1.0 + 0.2 * float(z[0]))
+        gz[0] += 0.1 * float(np.sum(X * DX))
+        GX = np.asfortranarray(DX * (1.0 + 0.2 * float(z[0])))
+        return f_b + f_s, gz, [GX]
+
+    res = minimize_box_stiefel(
+        fg,
+        z0=z0,
+        bounds=(lower, upper),
+        X0_list=X0,
+        options=FCOptions(
+            gtol=1.0e-8,
+            project_initial=0,
+            max_iter=500,
+            max_eval=2000,
+        ),
+        linear_constraint=(a, b),
+        copy=True,
+    )
+    assert res.status == FC_CONVERGED_GRAD
+    assert res.kkt_residual <= 1.0e-8
+    assert abs(float(np.dot(a, res.z)) - b) <= 1.0e-14 * (1.0 + abs(b))
+    assert res.orth_error <= 1.0e-13
+
+
+def test_active_bounds_no_liftoff_and_large_offset_default_ftol() -> None:
+    """Guards two solver invariants:
+
+    1. Constrained L-BFGS (`m=7`) on a capped simplex (`[0, 0.2]^16, a^T z = 1`)
+       with multiple active lower and upper bounds converges cleanly without
+       projection boundary lift-off ping-pong.
+    2. Coupled Box x Stiefel with large constant offset (`+500.0`) under default
+       `ftol` (`-1.0`) converges via `FC_CONVERGED_GRAD` rather than premature
+       `FC_CONVERGED_FTOL`.
+    """
+    # Part 1: Capped simplex with active lower and upper bounds
+    rng = np.random.default_rng(2025)
+    d = 16
+    n, p = 10, 2
+    lower = np.zeros(d, dtype=np.float64)
+    upper = np.full(d, 0.2, dtype=np.float64)
+    a = np.ones(d, dtype=np.float64)
+    b = 1.0
+    Q_d = project_stiefel(np.asfortranarray(rng.standard_normal((d, d))))
+    M = Q_d @ np.diag(np.geomspace(1.0, 50.0, d)) @ Q_d.T
+    M = 0.5 * (M + M.T)
+    lin_c = np.linspace(-2.5, 2.5, d)
+    D_st = np.arange(1.0, n + 1.0, dtype=np.float64)
+
+    z0, _ = project_linear_box(
+        rng.uniform(0.02, 0.18, size=d), lower, upper, a, b
+    )
+    X0 = project_stiefel(np.asfortranarray(rng.standard_normal((n, p))))
+
+    def fg_cap(
+        z: np.ndarray, xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X = xs[0]
+        Mz = M @ z
+        f_b = 0.5 * float(np.dot(z, Mz)) + float(np.dot(lin_c, z))
+        gz = Mz + lin_c
+        cw = np.array([0.5 + float(z[0]), 0.8 + float(z[1])], dtype=np.float64)
+        DX = D_st[:, None] * X
+        cq = np.sum(X * DX, axis=0)
+        f_s = 0.5 * float(np.dot(cw, cq))
+        gz[0] += 0.5 * cq[0]
+        gz[1] += 0.5 * cq[1]
+        GX = np.asfortranarray(DX * cw[None, :])
+        return f_b + f_s, gz, [GX]
+
+    res_cap = minimize_box_stiefel(
+        fg_cap,
+        z0=z0,
+        bounds=(lower, upper),
+        X0_list=X0,
+        options=FCOptions(gtol=1.0e-7, max_iter=500, max_eval=1500),
+        linear_constraint=(a, b),
+        copy=True,
+    )
+    assert res_cap.status == FC_CONVERGED_GRAD
+    assert res_cap.kkt_residual <= 1.0e-7
+    assert res_cap.n_eval <= 180
+    assert abs(float(np.sum(res_cap.z)) - b) <= 1.0e-14
+    assert int(np.sum(res_cap.z <= 1.0e-12)) >= 4
+    assert int(np.sum(res_cap.z >= 0.2 - 1.0e-12)) >= 2
+
+    # Part 2: Ill-conditioned objective with large constant offset (+500.0) and default ftol
+    d2 = 8
+    Q2 = project_stiefel(np.asfortranarray(rng.standard_normal((d2, d2))))
+    H2 = Q2 @ np.diag(np.geomspace(1.0, 2.0e3, d2)) @ Q2.T
+    H2 = 0.5 * (H2 + H2.T)
+    z_star2 = np.linspace(-0.3, 0.8, d2)
+    l2 = np.zeros(d2, dtype=np.float64)
+    u2 = np.ones(d2, dtype=np.float64)
+    z0_2 = np.full(d2, 0.5, dtype=np.float64)
+
+    def fg_offset(
+        z: np.ndarray, xs: list[np.ndarray]
+    ) -> tuple[float, np.ndarray, list[np.ndarray]]:
+        X = xs[0]
+        dz = z - z_star2
+        Hdz = H2 @ dz
+        DX = D_st[:, None] * X
+        f_val = 500.0 + 0.5 * float(np.dot(dz, Hdz)) + 0.5 * float(np.sum(X * DX))
+        return f_val, Hdz, [np.asfortranarray(DX)]
+
+    res_off = minimize_box_stiefel(
+        fg_offset,
+        z0=z0_2,
+        bounds=(l2, u2),
+        X0_list=X0,
+        options=FCOptions(gtol=1.0e-7, max_iter=2000, max_eval=5000),
+        copy=True,
+    )
+    assert res_off.status == FC_CONVERGED_GRAD
+    assert res_off.kkt_residual <= 1.0e-7
+

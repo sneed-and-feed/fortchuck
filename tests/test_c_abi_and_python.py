@@ -100,7 +100,7 @@ def _exact_spec_workspace_sizes(
 
 
 def test_struct_binary_layout_and_default_options_parity() -> None:
-    assert fc.__version__ == "0.2.0"
+    assert fc.__version__ == "0.2.1"
     assert FC_ERR_INFEASIBLE_LIN == -10
     assert fc.STATUS_NAMES[FC_ERR_INFEASIBLE_LIN] == "FC_ERR_INFEASIBLE_LIN"
     assert ctypes.sizeof(FCOptions) == 96
